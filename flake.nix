@@ -54,6 +54,16 @@
             type = types.path;
             description = "File containing AUPHONIC_API_KEY and other secrets";
           };
+          user = mkOption {
+            type = types.str;
+            default = "nobody";
+            description = "User to run the service as";
+          };
+          group = mkOption {
+            type = types.str;
+            default = "nogroup";
+            description = "Group to run the service as";
+          };
         };
 
         config = mkIf cfg.enable {
@@ -65,11 +75,11 @@
               ExecStart = "${self.packages.${pkgs.system}.default}/bin/auphonic-mcp-server http ${toString cfg.port}";
               EnvironmentFile = cfg.environmentFile;
               Restart = "always";
-              User = "nobody";
-              Group = "nogroup";
+              User = cfg.user;
+              Group = cfg.group;
               # Sandboxing
               ProtectSystem = "full";
-              ProtectHome = "true";
+              ProtectHome = "read-only"; # Changed from true to read-only to allow reading home dir if needed
               NoNewPrivileges = true;
               PrivateTmp = true;
             };
