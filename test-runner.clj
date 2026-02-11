@@ -1,10 +1,12 @@
 #!/usr/bin/env bb
 
 (require '[clojure.test :as t]
-         '[clojure.java.shell :as shell]
-         '[babashka.http-client :as http]
          '[cheshire.core :as json]
-         '[clojure.string :as str])
+         '[clojure.string :as str]
+         '[babashka.http-client :as http])
+
+;; Load server for in-process testing
+(load-file "auphonic-mcp-server.clj")
 
 ;; Configuration
 (defn get-free-port []
@@ -21,7 +23,7 @@
 (def mcp-endpoint (str server-url "/mcp"))
 
 ;; --- Test State ---
-(def server-process (atom nil))
+(def server-instance (atom nil))
 
 ;; --- Helpers ---
 
@@ -39,28 +41,20 @@
           (do (Thread/sleep 500)
               (recur (dec n))))))))
 
-(defn start-server! []
-  (println "Starting server for testing on port" test-port "...")
-  (let [proc (java.lang.ProcessBuilder.
-              ["bb" "auphonic-mcp-server.clj" (str test-port)])]
-    (.inheritIO proc)
-    (let [p (.start proc)]
-      (reset! server-process p)
-      (if (wait-for-health 20)
-        (println "Server is healthy.")
-        (do
-          (.destroy p)
-          (throw (ex-info "Server failed to start within timeout" {})))))))
-
-(defn stop-server! []
-  (when-let [p @server-process]
+(defn stop-test-server! []
+  (when @server-instance
     (println "Stopping server...")
-    (.destroy p)
-    (Thread/sleep 500)
-    (when (.isAlive p)
-      (println "Force killing server...")
-      (.destroyForcibly p))
-    (reset! server-process nil)))
+    (stop-server! @server-instance)
+    (reset! server-instance nil)))
+
+(defn start-test-server! []
+  (println "Starting server for testing on port" test-port "...")
+  (reset! server-instance (start-server! (str test-port)))
+  (if (wait-for-health 20)
+    (println "Server is healthy.")
+    (do
+      (stop-test-server!)
+      (throw (ex-info "Server failed to start within timeout" {})))))
 
 (defn rpc-request [method params & [session-id]]
   (let [body {:jsonrpc "2.0" :id 1 :method method :params params}
@@ -420,11 +414,11 @@
     (println "AUPHONIC_API_KEY not set. Running structural tests only."))
 
   (try
-    (start-server!)
+    (start-test-server!)
     (let [results (t/run-tests 'user)]
       (System/exit (if (zero? (+ (:fail results) (:error results))) 0 1)))
     (finally
-      (stop-server!))))
+      (stop-test-server!))))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (-main))
