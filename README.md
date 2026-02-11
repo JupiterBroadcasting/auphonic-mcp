@@ -211,7 +211,7 @@ curl -X DELETE http://localhost:3000/mcp \
 ./auphonic-mcp-server.clj 3001 &
 
 # Run tests
-./test-suite.clj
+bb test-runner.clj
 ```
 
 Tests cover:
@@ -323,11 +323,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=your-user
+User=auphonic-mcp
+Group=auphonic-mcp
 WorkingDirectory=/opt/auphonic-mcp
-Environment="AUPHONIC_API_KEY=your-key"
-Environment="AUPHONIC_PRESET_LUP=preset-uuid"
-Environment="AUPHONIC_PRESET_LAUNCH=preset-uuid"
+EnvironmentFile=/etc/auphonic-mcp/secrets
 ExecStart=/usr/local/bin/bb /opt/auphonic-mcp/auphonic-mcp-server.clj 3000
 Restart=on-failure
 RestartSec=5s
@@ -335,6 +334,8 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 ```
+
+**Note:** Store API keys in `EnvironmentFile`, not inline `Environment=` values.
 
 ### Docker
 
@@ -380,6 +381,54 @@ server {
     location /health {
         proxy_pass http://localhost:3000/health;
     }
+}
+```
+
+### NixOS Module
+
+Import the module from flake inputs and configure:
+
+```nix
+{ config, pkgs, ... }:
+
+let
+  secretsFile = "/etc/nixos/secrets/auphonic-mcp.env";
+in {
+  imports = [ inputs.auphonic-mcp.nixosModules.default ];
+
+  services.auphonic-mcp = {
+    enable = true;
+    port = 3000;
+    openFirewall = true;
+    environmentFile = secretsFile;
+  };
+}
+```
+
+Create secrets file (`/etc/nixos/secrets/auphonic-mcp.env`):
+
+```
+AUPHONIC_API_KEY=your-api-key
+AUPHONIC_PRESET_LUP=preset-uuid
+AUPHONIC_PRESET_LAUNCH=preset-uuid
+```
+
+### Home Manager Module
+
+```nix
+{ inputs, pkgs, ... }:
+
+{
+  imports = [ inputs.auphonic-mcp.homeManagerModules.default ];
+
+  programs.auphonic-mcp = {
+    enable = true;
+    apiKeyFile = "/home/user/.config/auphonic-mcp/api-key";
+    presets = {
+      lup = "preset-uuid";
+      launch = "preset-uuid";
+    };
+  };
 }
 ```
 
@@ -549,13 +598,8 @@ curl -H "Authorization: Bearer $AUPHONIC_API_KEY" \
 - **MCP Specification**: https://spec.modelcontextprotocol.io/
 - **Auphonic API**: https://auphonic.com/help/api/
 - **Babashka**: https://babashka.org/
-- **Repository**: [Your repo URL]
 
 ## License
 
 MIT
 
-## Support
-
-- Issues: [Your issue tracker]
-- Email: [Your email]

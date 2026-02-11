@@ -121,19 +121,15 @@
                 description = "Port to listen on";
               };
 
-              apiKey = mkOption {
-                type = types.str;
-                description = "Auphonic API key";
+              openFirewall = mkOption {
+                type = types.bool;
+                default = false;
+                description = "Open port in firewall";
               };
 
-              presets = mkOption {
-                type = types.attrsOf types.str;
-                default = {};
-                example = {
-                  lup = "preset-uuid-1";
-                  launch = "preset-uuid-2";
-                };
-                description = "Show name to preset UUID mapping";
+              environmentFile = mkOption {
+                type = types.path;
+                description = "File containing AUPHONIC_API_KEY and AUPHONIC_PRESET_* variables";
               };
 
               user = mkOption {
@@ -172,16 +168,10 @@
                   ReadWritePaths = [];
                 };
 
-                environment =
-                  {
-                    AUPHONIC_API_KEY = cfg.apiKey;
-                  }
-                  // (mapAttrs' (
-                      name: value:
-                        nameValuePair "AUPHONIC_PRESET_${toUpper name}" value
-                    )
-                    cfg.presets);
+                environmentFile = cfg.environmentFile;
               };
+
+              networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [cfg.port];
 
               # Create user and group
               users.users.${cfg.user} = {
