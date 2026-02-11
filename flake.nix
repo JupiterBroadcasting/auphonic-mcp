@@ -162,13 +162,6 @@
 
                   ExecStart = "${auphonic-mcp-server}/bin/auphonic-mcp-server ${toString cfg.port}";
 
-                  # Security hardening
-                  NoNewPrivileges = true;
-                  PrivateTmp = true;
-                  ProtectSystem = "strict";
-                  ProtectHome = true;
-                  ReadWritePaths = [];
-
                   EnvironmentFile = cfg.environmentFile;
                 };
               };
