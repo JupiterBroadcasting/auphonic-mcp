@@ -4,12 +4,13 @@
 
 Auphonic is an automatic audio post-production web service that provides a REST API for integrating audio processing algorithms into scripts, workflows, and applications. The API supports audio loudness normalization, intelligent leveling, noise reduction, encoding, metadata management, and automatic content deployment.
 
-**Official Documentation:** https://auphonic.com/help/api/  
+**Official Documentation:** https://auphonic.com/help/api/\
 **GitHub Examples:** https://github.com/auphonic/auphonic-api-examples
 
 ## Two API Flavors
 
 ### 1. Simple API (Recommended for Scripts)
+
 - **Endpoint:** `https://auphonic.com/api/simple/productions.json`
 - **Use Case:** Quick shell scripts, batch processing
 - **Advantage:** Single request to upload, process, and start production
@@ -17,6 +18,7 @@ Auphonic is an automatic audio post-production web service that provides a REST 
 - **Best for:** Referencing existing presets without detailed configuration
 
 ### 2. JSON API (Full Control)
+
 - **Endpoint:** `https://auphonic.com/api/productions.json`
 - **Use Case:** Complex workflows, detailed control
 - **Method:** Multiple requests with JSON payloads
@@ -25,17 +27,21 @@ Auphonic is an automatic audio post-production web service that provides a REST 
 ## Authentication Methods
 
 ### API Key Authentication (Recommended for Personal Use)
+
 ```bash
 -H "Authorization: Bearer {api_key}"
 ```
+
 Get your API key from: https://auphonic.com/account
 
 ### HTTP Basic Authentication
+
 ```bash
 -u "username:password"
 ```
 
 ### OAuth 2.0 (Required for Third-Party Apps)
+
 - Desktop/Mobile apps
 - Web applications with redirect URIs
 - Multi-user applications
@@ -43,7 +49,9 @@ Get your API key from: https://auphonic.com/account
 ## Core Concepts
 
 ### Productions
+
 A "production" is a single audio processing job. It includes:
+
 - Input file(s)
 - Processing algorithms
 - Output formats
@@ -53,7 +61,9 @@ A "production" is a single audio processing job. It includes:
 **UUID:** Each production has a unique 22-character identifier (e.g., `KKw7AxpLrDBQKLVnQCBtCh`)
 
 ### Presets
+
 Presets store reusable configurations:
+
 - Output formats and quality
 - Audio algorithm settings
 - Publishing destinations (outgoing services)
@@ -62,7 +72,9 @@ Presets store reusable configurations:
 **UUID:** Like productions, presets have unique identifiers
 
 ### External Services
+
 Connected storage/publishing platforms:
+
 - Dropbox, Google Drive, OneDrive
 - Amazon S3, SFTP, FTP
 - YouTube, SoundCloud, Libsyn, Blubrry
@@ -73,6 +85,7 @@ Connected storage/publishing platforms:
 ## Simple API Examples
 
 ### Basic Upload and Process
+
 ```bash
 curl -X POST https://auphonic.com/api/simple/productions.json \
   -H "Authorization: Bearer {api_key}" \
@@ -83,6 +96,7 @@ curl -X POST https://auphonic.com/api/simple/productions.json \
 ```
 
 ### With Metadata
+
 ```bash
 curl -X POST https://auphonic.com/api/simple/productions.json \
   -H "Authorization: Bearer {api_key}" \
@@ -97,6 +111,7 @@ curl -X POST https://auphonic.com/api/simple/productions.json \
 ```
 
 ### From HTTP URL
+
 ```bash
 curl -X POST https://auphonic.com/api/simple/productions.json \
   -H "Authorization: Bearer {api_key}" \
@@ -107,6 +122,7 @@ curl -X POST https://auphonic.com/api/simple/productions.json \
 ```
 
 ### From External Service (Dropbox, S3, etc.)
+
 ```bash
 curl -X POST https://auphonic.com/api/simple/productions.json \
   -H "Authorization: Bearer {api_key}" \
@@ -118,6 +134,7 @@ curl -X POST https://auphonic.com/api/simple/productions.json \
 ```
 
 ### With Chapters
+
 ```bash
 curl -X POST https://auphonic.com/api/simple/productions.json \
   -H "Authorization: Bearer {api_key}" \
@@ -129,6 +146,7 @@ curl -X POST https://auphonic.com/api/simple/productions.json \
 ```
 
 Chapter file format:
+
 ```
 00:00:00.000 Intro <http://example.com>
 00:05:30.000 Main Topic
@@ -138,6 +156,7 @@ Chapter file format:
 ## JSON API Workflow
 
 ### Step 1: Create Production
+
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   https://auphonic.com/api/productions.json \
@@ -151,6 +170,7 @@ curl -X POST -H "Content-Type: application/json" \
 ```
 
 Response includes production UUID:
+
 ```json
 {
   "status_code": 200,
@@ -162,6 +182,7 @@ Response includes production UUID:
 ```
 
 ### Step 2: Upload File (Optional - if local file)
+
 ```bash
 curl -X POST \
   https://auphonic.com/api/production/KKw7AxpLrDBQKLVnQCBtCh/upload.json \
@@ -170,6 +191,7 @@ curl -X POST \
 ```
 
 ### Step 3: Start Processing
+
 ```bash
 curl -X POST \
   https://auphonic.com/api/production/KKw7AxpLrDBQKLVnQCBtCh/start.json \
@@ -179,12 +201,14 @@ curl -X POST \
 ## Querying Data
 
 ### Get Production Details
+
 ```bash
 curl https://auphonic.com/api/production/{uuid}.json \
   -H "Authorization: Bearer {api_key}"
 ```
 
 Response includes:
+
 - `status`: Status code (0-3)
 - `status_string`: "Waiting", "Error", "Done", etc.
 - `length`: Duration in seconds
@@ -194,34 +218,40 @@ Response includes:
 - `outgoing_services`: Publishing status
 
 ### List All Productions
+
 ```bash
 curl https://auphonic.com/api/productions.json \
   -H "Authorization: Bearer {api_key}"
 ```
 
 ### List Presets
+
 ```bash
 curl https://auphonic.com/api/presets.json \
   -H "Authorization: Bearer {api_key}"
 ```
 
 ### List External Services
+
 ```bash
 curl https://auphonic.com/api/services.json \
   -H "Authorization: Bearer {api_key}"
 ```
 
 ### Query Available Algorithms
+
 ```bash
 curl https://auphonic.com/api/info/algorithms.json
 ```
 
 ### Query Output Formats
+
 ```bash
 curl https://auphonic.com/api/info/output_file_formats.json
 ```
 
 ### Query Production Status Codes
+
 ```bash
 curl https://auphonic.com/api/info/production_status.json
 ```
@@ -236,6 +266,7 @@ curl https://auphonic.com/api/info/production_status.json
 ## Webhooks
 
 ### Set Webhook on Production
+
 ```bash
 curl -H "Content-Type: application/json" -X POST \
   https://auphonic.com/api/production/{uuid}.json \
@@ -244,6 +275,7 @@ curl -H "Content-Type: application/json" -X POST \
 ```
 
 ### Webhook Payload (when production finishes)
+
 ```
 POST /callback HTTP/1.1
 Content-Type: multipart/form-data
@@ -265,6 +297,7 @@ curl https://auphonic.com/api/production/{uuid}.json \
 ```
 
 Response includes `output_files` array:
+
 ```json
 {
   "data": {
@@ -282,6 +315,7 @@ Response includes `output_files` array:
 ```
 
 Download file:
+
 ```bash
 curl "https://auphonic.com/api/download/audio-result/{file_id}/{filename}.mp3" \
   -H "Authorization: Bearer {api_key}" \
@@ -289,6 +323,7 @@ curl "https://auphonic.com/api/download/audio-result/{file_id}/{filename}.mp3" \
 ```
 
 Or use bearer token in URL for streaming:
+
 ```bash
 curl "https://auphonic.com/api/download/audio-result/{file_id}/{filename}.mp3?bearer_token={api_key}"
 ```
@@ -296,6 +331,7 @@ curl "https://auphonic.com/api/download/audio-result/{file_id}/{filename}.mp3?be
 ## Audio Algorithm Parameters
 
 Common parameters:
+
 - `filtering`: High-pass filter for speech (true/false)
 - `normloudness`: Global loudness normalization (true/false)
 - `loudnesstarget`: Target loudness in LUFS (e.g., -16, -18, -23)
@@ -305,6 +341,7 @@ Common parameters:
 - `leveler`: Speech/music leveler (true/false)
 
 Example:
+
 ```bash
 curl -X POST https://auphonic.com/api/simple/productions.json \
   -H "Authorization: Bearer {api_key}" \
@@ -356,6 +393,7 @@ curl -X POST -H "Content-Type: application/json" \
 ```
 
 Upload files for each track:
+
 ```bash
 curl -X POST \
   https://auphonic.com/api/production/{uuid}/upload.json \
@@ -386,6 +424,7 @@ curl -H "Content-Type: application/json" -X POST \
 ## Common Workflows
 
 ### Batch Processing Multiple Files
+
 ```bash
 #!/bin/bash
 PRESET="your-preset-uuid"
@@ -402,6 +441,7 @@ done
 ```
 
 ### Process and Download
+
 ```bash
 #!/bin/bash
 # 1. Upload and start
@@ -437,6 +477,7 @@ curl "$DOWNLOAD_URL" -H "Authorization: Bearer $API_KEY" -o result.mp3
 ```
 
 ### Using Webhooks (Better than Polling)
+
 ```bash
 # Start production with webhook
 curl -X POST https://auphonic.com/api/simple/productions.json \
@@ -454,17 +495,18 @@ curl -X POST https://auphonic.com/api/simple/productions.json \
 ## Important Notes
 
 1. **Use Webhooks, Not Polling:** For production status, use webhooks instead of frequent polling
-2. **Preset UUIDs:** Find preset UUIDs on the Auphonic preset page
-3. **Service UUIDs:** Get external service UUIDs from `/api/services.json`
-4. **Rate Limits:** Not explicitly documented, but use reasonable request rates
-5. **File Size Limits:** Depend on your account plan
-6. **Credits:** Processing consumes credits based on audio length and features used
-7. **Multipart vs JSON:** File uploads use multipart/form-data, configuration uses application/json
-8. **Content-Type Header:** Critical for JSON API requests
+1. **Preset UUIDs:** Find preset UUIDs on the Auphonic preset page
+1. **Service UUIDs:** Get external service UUIDs from `/api/services.json`
+1. **Rate Limits:** Not explicitly documented, but use reasonable request rates
+1. **File Size Limits:** Depend on your account plan
+1. **Credits:** Processing consumes credits based on audio length and features used
+1. **Multipart vs JSON:** File uploads use multipart/form-data, configuration uses application/json
+1. **Content-Type Header:** Critical for JSON API requests
 
 ## Error Handling
 
 Responses include error information:
+
 ```json
 {
   "status_code": 400,
@@ -477,6 +519,7 @@ Responses include error information:
 ```
 
 HTTP status codes:
+
 - 200: Success
 - 400: Bad request
 - 401: Authentication failed
@@ -498,24 +541,28 @@ HTTP status codes:
 ## Example Use Cases for Podcast Workflows
 
 1. **Automated Episode Processing:**
+
    - Upload from Dropbox/S3
    - Apply loudness normalization
    - Add chapters and metadata
    - Publish to hosting platform
 
-2. **Multitrack Recording Cleanup:**
+1. **Multitrack Recording Cleanup:**
+
    - Upload separate host/guest tracks
    - Auto-level speakers
    - Noise reduction per track
    - Mix to stereo output
 
-3. **Batch Archive Processing:**
+1. **Batch Archive Processing:**
+
    - Loop through folder of old episodes
    - Apply modern loudness standards
    - Re-encode to efficient formats
    - Archive to S3
 
-4. **Live Recording Pipeline:**
+1. **Live Recording Pipeline:**
+
    - Watch folder monitors recording directory
    - New file triggers production
    - Webhook notifies when ready
