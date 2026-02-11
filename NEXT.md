@@ -34,7 +34,7 @@ in {
 
   services.auphonic-mcp = {
     enable = true;
-    port = 3000;
+    port = 3003;
     openFirewall = true;
     environmentFile = secretsFile;
   };
@@ -74,6 +74,6 @@ ______________________________________________________________________
 
 ## Notes
 
-- Tests run on port 3002 to avoid conflicts with other MCP servers
+- Tests use dynamic port allocation to avoid conflicts
 - API key required for tests that make actual Auphonic API calls
 - Server-side validation handles show-specific episode types

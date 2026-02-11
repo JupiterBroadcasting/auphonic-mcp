@@ -69,7 +69,7 @@
             echo "Babashka version: $(bb --version)"
             echo ""
             echo "Available commands:"
-            echo "  bb auphonic-mcp-server.clj 3000  - Run server on port 3000"
+            echo "  bb auphonic-mcp-server.clj 3003  - Run server on port 3003"
             echo "  bb test-runner.clj                 - Run test suite"
             echo "  bb --version                      - Check Babashka version"
             echo ""
@@ -117,7 +117,7 @@
 
               port = mkOption {
                 type = types.port;
-                default = 3000;
+                default = 3003;
                 description = "Port to listen on";
               };
 

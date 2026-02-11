@@ -31,10 +31,10 @@ export AUPHONIC_PRESET_LAUNCH="preset-uuid"
 
 # Run server
 chmod +x auphonic-mcp-server.clj
-./auphonic-mcp-server.clj 3000
+./auphonic-mcp-server.clj 3003
 ```
 
-Server runs on `http://localhost:3000` with endpoint `/mcp`.
+Server runs on `http://localhost:3003` with endpoint `/mcp`.
 
 ## Configuration
 
@@ -140,7 +140,7 @@ Add more shows by editing `show-types` in server file.
 **Initialize Session:**
 
 ```bash
-curl -X POST http://localhost:3000/mcp \
+curl -X POST http://localhost:3003/mcp \
   -H "Accept: application/json, text/event-stream" \
   -H "Content-Type: application/json" \
   -d '{
@@ -158,7 +158,7 @@ curl -X POST http://localhost:3000/mcp \
 Response includes `Mcp-Session-Id` header. Use this in all subsequent requests:
 
 ```bash
-curl -X POST http://localhost:3000/mcp \
+curl -X POST http://localhost:3003/mcp \
   -H "Mcp-Session-Id: {session-id}" \
   -H "Content-Type: application/json" \
   -d '{
@@ -172,7 +172,7 @@ curl -X POST http://localhost:3000/mcp \
 **Terminate Session:**
 
 ```bash
-curl -X DELETE http://localhost:3000/mcp \
+curl -X DELETE http://localhost:3003/mcp \
   -H "Mcp-Session-Id: {session-id}"
 ```
 
@@ -229,13 +229,13 @@ Tests cover:
 **Health Check:**
 
 ```bash
-curl http://localhost:3000/health
+curl http://localhost:3003/health
 ```
 
 **Initialize:**
 
 ```bash
-curl -X POST http://localhost:3000/mcp \
+curl -X POST http://localhost:3003/mcp \
   -H "Accept: application/json" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"test","version":"1.0"},"capabilities":{}}}'
@@ -244,7 +244,7 @@ curl -X POST http://localhost:3000/mcp \
 **List Tools:**
 
 ```bash
-curl -X POST http://localhost:3000/mcp \
+curl -X POST http://localhost:3003/mcp \
   -H "Mcp-Session-Id: YOUR_SESSION_ID" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
@@ -260,7 +260,7 @@ Configure in your agent's MCP settings:
 {
   "mcpServers": {
     "auphonic": {
-      "url": "http://localhost:3000/mcp",
+      "url": "http://localhost:3003/mcp",
       "env": {
         "AUPHONIC_API_KEY": "your-key",
         "AUPHONIC_PRESET_LUP": "preset-uuid",
@@ -277,7 +277,7 @@ Configure in your agent's MCP settings:
 import requests
 
 # Initialize
-response = requests.post('http://localhost:3000/mcp', 
+response = requests.post('http://localhost:3003/mcp', 
     headers={
         'Accept': 'application/json',
         'Content-Type': 'application/json'
@@ -296,7 +296,7 @@ response = requests.post('http://localhost:3000/mcp',
 session_id = response.headers['Mcp-Session-Id']
 
 # Use tools
-response = requests.post('http://localhost:3000/mcp',
+response = requests.post('http://localhost:3003/mcp',
     headers={
         'Mcp-Session-Id': session_id,
         'Content-Type': 'application/json'
@@ -327,7 +327,7 @@ User=auphonic-mcp
 Group=auphonic-mcp
 WorkingDirectory=/opt/auphonic-mcp
 EnvironmentFile=/etc/auphonic-mcp/secrets
-ExecStart=/usr/local/bin/bb /opt/auphonic-mcp/auphonic-mcp-server.clj 3000
+ExecStart=/usr/local/bin/bb /opt/auphonic-mcp/auphonic-mcp-server.clj 3003
 Restart=on-failure
 RestartSec=5s
 
@@ -349,14 +349,14 @@ ENV AUPHONIC_API_KEY=""
 ENV AUPHONIC_PRESET_LUP=""
 ENV AUPHONIC_PRESET_LAUNCH=""
 
-EXPOSE 3000
+EXPOSE 3003
 
-CMD ["bb", "auphonic-mcp-server.clj", "3000"]
+CMD ["bb", "auphonic-mcp-server.clj", "3003"]
 ```
 
 ```bash
 docker build -t auphonic-mcp .
-docker run -p 3000:3000 \
+docker run -p 3003:3003 \
   -e AUPHONIC_API_KEY="your-key" \
   -e AUPHONIC_PRESET_LUP="preset-uuid" \
   -e AUPHONIC_PRESET_LAUNCH="preset-uuid" \
@@ -371,7 +371,7 @@ server {
     server_name auphonic-mcp.example.com;
 
     location /mcp {
-        proxy_pass http://localhost:3000/mcp;
+        proxy_pass http://localhost:3003/mcp;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -379,7 +379,7 @@ server {
     }
 
     location /health {
-        proxy_pass http://localhost:3000/health;
+        proxy_pass http://localhost:3003/health;
     }
 }
 ```
@@ -398,7 +398,7 @@ in {
 
   services.auphonic-mcp = {
     enable = true;
-    port = 3000;
+    port = 3003;
     openFirewall = true;
     environmentFile = secretsFile;
   };
@@ -548,7 +548,7 @@ Invalid inputs return clear error messages.
 bb --version
 
 # Check port available
-lsof -i :3000
+lsof -i :3003
 
 # Check environment variables
 env | grep AUPHONIC
