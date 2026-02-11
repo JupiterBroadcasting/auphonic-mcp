@@ -690,14 +690,13 @@
 ;; ============================================================================
 
 (defn start-server! [& [port]]
-  (let [port (Integer/parseInt (or port "3000"))]
-    (println (str "Auphonic MCP Server v" (:version server-info)))
-    (println (str "Protocol version: " protocol-version))
-    (println (str "Listening on http://localhost:" port))
-    (println "POST to /mcp for JSON-RPC requests")
-    (println "GET /health for health check")
-    (println "DELETE /mcp with Mcp-Session-Id to terminate session")
-    (server/run-server http-handler {:port port})))
+  (println (str "Auphonic MCP Server v" (:version server-info)))
+  (println (str "Protocol version: " protocol-version))
+  (println (str "Listening on http://localhost:" port))
+  (println "POST to /mcp for JSON-RPC requests")
+  (println "GET /health for health check")
+  (println "DELETE /mcp with Mcp-Session-Id to terminate session")
+  (server/run-server http-handler {:port port}))
 
 (defn stop-server! [server]
   (server/server-stop! server))
@@ -705,7 +704,7 @@
 (defn -main [& args]
   (let [port (if (seq args)
                (Integer/parseInt (first args))
-               3000)]
+               3003)]
     (start-server! port)
     @(promise)))
 

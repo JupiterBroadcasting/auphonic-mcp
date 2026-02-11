@@ -15,9 +15,9 @@
     (.getLocalPort s)))
 
 (def test-port
-  (if-let [env-port (System/getenv "TEST_PORT")]
-    (Integer/parseInt env-port)
-    3002))
+  (or (when-let [env-port (System/getenv "TEST_PORT")]
+        (Integer/parseInt env-port))
+      (get-free-port)))
 
 (def server-url (str "http://localhost:" test-port))
 (def mcp-endpoint (str server-url "/mcp"))
@@ -49,7 +49,7 @@
 
 (defn start-test-server! []
   (println "Starting server for testing on port" test-port "...")
-  (reset! server-instance (start-server! (str test-port)))
+  (reset! server-instance (start-server! test-port))
   (if (wait-for-health 20)
     (println "Server is healthy.")
     (do
@@ -406,6 +406,63 @@
       (let [state-resp (http/get (str server-url "/health"))
             body (json/parse-string (:body state-resp) true)]
         (t/is (contains? body :sessions) "Health should return sessions count")))))
+
+;; --- Port Configuration Tests (Subprocess) ---
+
+(defn wait-for-server [port max-retries]
+  (loop [n max-retries]
+    (let [healthy? (try
+                     (let [resp (http/get (str "http://localhost:" port "/health")
+                                          {:throw false :timeout 1000})]
+                       (= 200 (:status resp)))
+                     (catch Exception _
+                       false))]
+      (if healthy?
+        true
+        (if (zero? n)
+          false
+          (do (Thread/sleep 200)
+              (recur (dec n))))))))
+
+(defn start-subprocess-server [port]
+  (let [cmd (if port
+              ["bb" "auphonic-mcp-server.clj" (str port)]
+              ["bb" "auphonic-mcp-server.clj"])
+        pb (ProcessBuilder. cmd)
+        proc (.start pb)]
+    {:process proc :port (or port 3003)}))
+
+(defn stop-subprocess-server [{:keys [process]}]
+  (when process
+    (.destroyForcibly process)
+    (.waitFor process 5 java.util.concurrent.TimeUnit/SECONDS)))
+
+(t/deftest test-server-starts-on-default-port
+  (t/testing "Server starts on default port 3003 when no port arg provided"
+    (let [{:keys [process port] :as server} (start-subprocess-server nil)]
+      (try
+        (t/is (wait-for-server port 30)
+              (str "Server should start and respond on default port " port))
+        (t/is (= 3003 port) "Default port should be 3003")
+        (let [resp (http/get (str "http://localhost:" port "/health") {:throw false})]
+          (t/is (= 200 (:status resp)))
+          (t/is (= "ok" (:status (json/parse-string (:body resp) true)))))
+        (finally
+          (stop-subprocess-server server))))))
+
+(t/deftest test-server-starts-on-custom-port
+  (t/testing "Server starts on custom port when port arg provided"
+    (let [custom-port (get-free-port)
+          {:keys [process port] :as server} (start-subprocess-server custom-port)]
+      (try
+        (t/is (wait-for-server port 30)
+              (str "Server should start and respond on custom port " port))
+        (t/is (= custom-port port) "Port should match what we requested")
+        (let [resp (http/get (str "http://localhost:" port "/health") {:throw false})]
+          (t/is (= 200 (:status resp)))
+          (t/is (= "ok" (:status (json/parse-string (:body resp) true)))))
+        (finally
+          (stop-subprocess-server server))))))
 
 ;; --- Main Entry ---
 
