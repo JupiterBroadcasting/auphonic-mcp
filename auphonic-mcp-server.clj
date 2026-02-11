@@ -1,40 +1,88 @@
 #!/usr/bin/env bb
 
 ;; Auphonic MCP Server
-;; Provides Model Context Protocol interface to Auphonic API
+;; HTTP-based Model Context Protocol server for Auphonic API
+;; Implements Streamable HTTP transport (MCP spec 2025-03-26)
 
-(require '[org.httpkit.server :as server])
-(require '[cheshire.core :as json])
-(require '[clojure.string :as str])
-(require '[babashka.curl :as curl])
-(require '[clojure.java.io :as io])
+(require '[org.httpkit.server :as server]
+         '[cheshire.core :as json]
+         '[clojure.string :as str]
+         '[babashka.http-client :as http]
+         '[babashka.fs :as fs]
+         '[clojure.java.io :as io])
 
 ;; ============================================================================
-;; Configuration
+;; Configuration & Constants
 ;; ============================================================================
 
-(def server-info
+(def ^:const protocol-version "2025-03-26")
+(def ^:const server-info
   {:name "auphonic-mcp-server"
-   :version "1.0.0"})
+   :version "2.0.0"})
 
-(def auphonic-api-base "https://auphonic.com/api")
+(def ^:const auphonic-api-base "https://auphonic.com/api")
 
-;; Show configuration
-(def show-types
+(def ^:const show-types
   {"lup" ["bootleg" "adfree" "main"]
    "launch" ["bootleg" "main"]})
+
+(def ^:const capabilities
+  {:tools {:listChanged false}
+   :resources {:subscribe false :listChanged false}
+   :prompts {:listChanged false}})
 
 ;; ============================================================================
 ;; State Management
 ;; ============================================================================
 
 (def server-state
-  (atom {:initialized false
-         :capabilities nil
-         :recent-productions []}))
+  (atom {:sessions {}
+         :recent-productions []
+         :rate-limits {}}))
+
+(def ^:const rate-limit-max-requests 60)
+(def ^:const rate-limit-window-ms 60000)
+
+(defn gen-session-id []
+  (str (random-uuid)))
+
+(defn create-session! []
+  (let [session-id (gen-session-id)
+        session {:id session-id
+                 :initialized false
+                 :created-at (System/currentTimeMillis)}]
+    (swap! server-state assoc-in [:sessions session-id] session)
+    session-id))
+
+(defn get-session [session-id]
+  (get-in @server-state [:sessions session-id]))
+
+(defn update-session! [session-id f & args]
+  (swap! server-state update-in [:sessions session-id] #(apply f % args)))
+
+(defn delete-session! [session-id]
+  (swap! server-state update :sessions dissoc session-id))
+
+(defn track-production! [uuid]
+  (swap! server-state update :recent-productions
+         #(vec (take 20 (cons uuid %)))))
+
+(defn check-rate-limit [session-id]
+  (when session-id
+    (let [now (System/currentTimeMillis)
+          window-start (- now rate-limit-window-ms)
+          requests (get-in @server-state [:rate-limits session-id])
+          recent-requests (filter #(> % window-start) requests)]
+      (when (>= (count recent-requests) rate-limit-max-requests)
+        {:rate-limited true :retry-after (int (/ rate-limit-window-ms 1000))}))))
+
+(defn record-request! [session-id]
+  (when session-id
+    (swap! server-state update-in [:rate-limits session-id]
+           conj (System/currentTimeMillis))))
 
 ;; ============================================================================
-;; Auphonic API Client Functions (from auphonic-cli.clj)
+;; Environment & Validation
 ;; ============================================================================
 
 (defn get-api-key []
@@ -45,184 +93,225 @@
 
 (defn validate-show [show]
   (when-not (contains? show-types show)
-    {:error "Invalid show. Must be one of: lup, launch"}))
+    {:error (str "Invalid show. Must be one of: " (str/join ", " (keys show-types)))}))
 
 (defn validate-type [show type]
   (when-not (some #{type} (get show-types show))
-    {:error (str "Invalid type for show " show ". Valid types: " 
+    {:error (str "Invalid type for show " show ". Valid types: "
                  (str/join ", " (get show-types show)))}))
 
 (defn validate-file-exists [path]
-  (when-not (.exists (io/file path))
+  (when-not (fs/exists? path)
     {:error (str "File not found: " path)}))
 
-(defn auphonic-request [method endpoint & {:keys [form-data]}]
+(defn validate-required-fields [args required-fields]
+  (let [missing (remove #(contains? args %) required-fields)]
+    (when (seq missing)
+      {:error (str "Missing required fields: " (str/join ", " (map name missing)))})))
+
+;; ============================================================================
+;; HTTP Client for Auphonic API
+;; ============================================================================
+
+(defn auphonic-request
+  "Make HTTP request to Auphonic API using babashka.http-client"
+  [method endpoint & {:keys [form-data query-params]}]
   (let [api-key (get-api-key)
-        url (str auphonic-api-base endpoint)
-        headers {"Authorization" (str "Bearer " api-key)}]
-    (try
-      (let [response (case method
-                       :get (curl/get url {:headers headers})
-                       :post (if form-data
-                               (let [form-params (reduce-kv
-                                                   (fn [acc k v]
-                                                     (if (= k :input_file)
-                                                       (conj acc [k (io/file v)])
-                                                       (conj acc [k v])))
-                                                   []
-                                                   form-data)]
-                                 (curl/post url {:headers headers
-                                                :form-params form-params}))
-                               (curl/post url {:headers headers}))
-                       :delete (curl/delete url {:headers headers}))
-            body (json/parse-string (:body response) true)]
-        {:success true :data body})
-      (catch Exception e
-        {:success false :error (str "API request failed: " (.getMessage e))}))))
+        url (str auphonic-api-base endpoint)]
+    (if-not api-key
+      {:success false :error "AUPHONIC_API_KEY not set"}
+      (try
+        (let [base-opts {:headers {"Authorization" (str "Bearer " api-key)}
+                         :throw false}
+              opts (cond-> base-opts
+                     query-params (assoc :query-params query-params)
+                     form-data (assoc :form-params form-data))
+              response (case method
+                         :get (http/get url opts)
+                         :post (http/post url opts)
+                         :delete (http/delete url opts))]
+          (cond
+            (< (:status response) 300)
+            {:success true :data (json/parse-string (:body response) true)}
+
+            (= 401 (:status response))
+            {:success false :error "Authentication failed. Check API key."}
+
+            (= 404 (:status response))
+            {:success false :error "Resource not found"}
+
+            :else
+            {:success false :error (str "API error: HTTP " (:status response))}))
+        (catch Exception e
+          {:success false :error (str "Request failed: " (.getMessage e))})))))
 
 ;; ============================================================================
 ;; MCP Tool Implementations
 ;; ============================================================================
 
 (defn tool-upload-audio [{:keys [show type file_path title subtitle summary]}]
-  (if-let [api-key (get-api-key)]
+  (if-let [validation-error (or (validate-required-fields
+                                 {:show show :type type :file_path file_path}
+                                 [:show :type :file_path])
+                                (validate-show show)
+                                (validate-type show type)
+                                (validate-file-exists file_path))]
+    {:error (:error validation-error)}
+
     (if-let [preset (get-preset-for-show show)]
-      (if-let [error (or (validate-show show)
-                         (validate-type show type)
-                         (validate-file-exists file_path))]
-        {:error (:error error)}
-        (let [filename (last (str/split file_path #"/"))
-              title (or title (str (str/upper-case show) " - " filename))
-              form-data (cond-> {:preset preset
-                                :title title
-                                :input_file file_path
-                                :action "start"}
-                          subtitle (assoc :subtitle subtitle)
-                          summary (assoc :summary summary))
-              result (auphonic-request :post "/simple/productions.json" :form-data form-data)]
-          (if (:success result)
-            (let [production (get-in result [:data :data])
-                  uuid (:uuid production)]
-              ;; Track in state
-              (swap! server-state update :recent-productions 
-                     #(take 10 (conj % uuid)))
-              {:content [{:type "text"
-                         :text (str "✓ Upload started successfully!\n"
-                                   "Production UUID: " uuid "\n"
-                                   "Status: " (:status_string production) "\n"
-                                   "View: https://auphonic.com/production/" uuid)}]
-               :production_uuid uuid})
-            {:error (or (get-in result [:data :error_message])
-                       (:error result)
-                       "Upload failed")})))
-      {:error (str "AUPHONIC_PRESET_" (str/upper-case show) " environment variable not set")})
-    {:error "AUPHONIC_API_KEY environment variable not set"}))
+      (let [filename (fs/file-name file_path)
+            title (or title (str (str/upper-case show) " - " filename))
+            api-key (get-api-key)
+            url (str auphonic-api-base "/simple/productions.json")
+            multipart-parts (cond-> [{:name "preset" :content preset}
+                                     {:name "title" :content title}
+                                     {:name "input_file" :content (io/file file_path)}
+                                     {:name "action" :content "start"}]
+                              subtitle (conj {:name "subtitle" :content subtitle})
+                              summary (conj {:name "summary" :content summary}))]
+
+        (try
+          (let [response (http/post url
+                                    {:headers {"Authorization" (str "Bearer " api-key)}
+                                     :multipart multipart-parts
+                                     :throw false})]
+            (if (< (:status response) 300)
+              (let [data (json/parse-string (:body response) true)
+                    production (:data data)
+                    uuid (:uuid production)]
+                (track-production! uuid)
+                {:content [{:type "text"
+                            :text (str "✓ Upload started successfully!\n"
+                                       "Production UUID: " uuid "\n"
+                                       "Status: " (:status_string production) "\n"
+                                       "View: https://auphonic.com/production/" uuid)}]
+                 :production_uuid uuid})
+              {:error (str "Upload failed: HTTP " (:status response))}))
+          (catch Exception e
+            {:error (str "Upload failed: " (.getMessage e))})))
+
+      {:error (str "AUPHONIC_PRESET_" (str/upper-case show)
+                   " environment variable not set")})))
 
 (defn tool-check-status [{:keys [production_uuid]}]
-  (let [result (auphonic-request :get (str "/production/" production_uuid ".json"))]
-    (if (:success result)
-      (let [production (get-in result [:data :data])
-            {:keys [uuid status status_string length metadata output_files]} production
-            title (get metadata :title "Untitled")]
-        {:content [{:type "text"
-                   :text (str "Production: " uuid "\n"
-                             "Title: " title "\n"
-                             "Status: " status_string " (code: " status ")\n"
-                             (when length 
-                               (str "Length: " (int (/ length 60)) " min " 
-                                    (mod (int length) 60) " sec\n"))
-                             (when (and (= status 3) (seq output_files))
-                               (str "Output files: " (count output_files) " available\n"
-                                    "Formats: " (str/join ", " (map :format output_files)) "\n")))}]
-         :status status
-         :status_string status_string})
-      {:error (or (get-in result [:data :error_message])
-                 (:error result)
-                 "Failed to get status")})))
+  (if-let [validation-error (validate-required-fields
+                             {:production_uuid production_uuid}
+                             [:production_uuid])]
+    {:error (:error validation-error)}
+
+    (let [result (auphonic-request :get (str "/production/" production_uuid ".json"))]
+      (if (:success result)
+        (let [production (get-in result [:data :data])
+              {:keys [uuid status status_string length metadata output_files]} production
+              title (get metadata :title "Untitled")]
+          {:content [{:type "text"
+                      :text (str "Production: " uuid "\n"
+                                 "Title: " title "\n"
+                                 "Status: " status_string " (code: " status ")\n"
+                                 (when length
+                                   (str "Length: " (int (/ length 60)) " min "
+                                        (mod (int length) 60) " sec\n"))
+                                 (when (and (= status 3) (seq output_files))
+                                   (str "Output files: " (count output_files) " available\n"
+                                        "Formats: " (str/join ", " (map :format output_files)) "\n")))}]
+           :status status
+           :status_string status_string})
+        {:error (or (get-in result [:data :error_message])
+                    (:error result)
+                    "Failed to get status")}))))
 
 (defn tool-list-productions [{:keys [limit offset status]}]
   (let [params (cond-> {}
                  limit (assoc :limit limit)
                  offset (assoc :offset offset)
                  status (assoc :status status))
-        query-string (when (seq params)
-                      (str "?" (str/join "&" (map (fn [[k v]] (str (name k) "=" v)) params))))
-        result (auphonic-request :get (str "/productions.json" (or query-string "")))]
+        result (auphonic-request :get "/productions.json" :query-params params)]
+
     (if (:success result)
       (let [productions (get-in result [:data :data])
             formatted (str/join "\n\n"
-                        (map (fn [prod]
-                               (let [{:keys [uuid status_string metadata change_time]} prod
-                                     title (get metadata :title "Untitled")]
-                                 (str "• " uuid "\n"
-                                      "  Title: " title "\n"
-                                      "  Status: " status_string "\n"
-                                      "  Updated: " change_time)))
-                             productions))]
+                                (map (fn [prod]
+                                       (let [{:keys [uuid status_string metadata change_time]} prod
+                                             title (get metadata :title "Untitled")]
+                                         (str "• " uuid "\n"
+                                              "  Title: " title "\n"
+                                              "  Status: " status_string "\n"
+                                              "  Updated: " change_time)))
+                                     productions))]
         {:content [{:type "text"
-                   :text (str "Total productions: " (count productions) "\n\n" formatted)}]
+                    :text (str "Total productions: " (count productions) "\n\n" formatted)}]
          :count (count productions)})
       {:error (or (get-in result [:data :error_message])
-                 (:error result)
-                 "Failed to list productions")})))
+                  (:error result)
+                  "Failed to list productions")})))
 
 (defn tool-download-output [{:keys [production_uuid output_path format]}]
-  (let [result (auphonic-request :get (str "/production/" production_uuid ".json"))]
-    (if (:success result)
-      (let [production (get-in result [:data :data])
-            status (:status production)]
-        (if (= 3 status)
-          (let [output-files (:output_files production)
-                file (if format
-                       (first (filter #(= format (:format %)) output-files))
-                       (first output-files))]
-            (if file
-              (let [download-url (:download_url file)
-                    api-key (get-api-key)
-                    download-url-with-token (str download-url "?bearer_token=" api-key)
-                    filename (or (:filename file) (str "output." (:ending file)))
-                    output-file (io/file output_path filename)]
-                (try
-                  (curl/get download-url-with-token 
-                           {:as :stream
-                            :raw-args ["-o" (str output-file)]})
-                  {:content [{:type "text"
-                             :text (str "✓ Downloaded to " output-file)}]
-                   :file_path (str output-file)}
-                  (catch Exception e
-                    {:error (str "Download failed: " (.getMessage e))})))
-              {:error (str "No output file found" 
-                          (when format (str " with format: " format)))}))
-          {:error (str "Production not finished yet. Status: " (:status_string production))}))
-      {:error (or (get-in result [:data :error_message])
-                 (:error result)
-                 "Failed to get production details")})))
+  (if-let [validation-error (validate-required-fields
+                             {:production_uuid production_uuid :output_path output_path}
+                             [:production_uuid :output_path])]
+    {:error (:error validation-error)}
+
+    (let [result (auphonic-request :get (str "/production/" production_uuid ".json"))]
+      (if (:success result)
+        (let [production (get-in result [:data :data])
+              status (:status production)]
+          (if (= 3 status)
+            (let [output-files (:output_files production)
+                  file (if format
+                         (first (filter #(= format (:format %)) output-files))
+                         (first output-files))]
+              (if file
+                (let [download-url (:download_url file)
+                      api-key (get-api-key)
+                      download-url-with-token (str download-url "?bearer_token=" api-key)
+                      filename (or (:filename file) (str "output." (:ending file)))
+                      output-file (io/file output_path filename)]
+                  (try
+                    (io/copy
+                     (:body (http/get download-url-with-token {:as :stream}))
+                     output-file)
+                    {:content [{:type "text"
+                                :text (str "✓ Downloaded to " output-file)}]
+                     :file_path (str output-file)}
+                    (catch Exception e
+                      {:error (str "Download failed: " (.getMessage e))})))
+                {:error (str "No output file found"
+                             (when format (str " with format: " format)))}))
+            {:error (str "Production not finished yet. Status: " (:status_string production))}))
+        {:error (or (get-in result [:data :error_message])
+                    (:error result)
+                    "Failed to get production details")}))))
 
 (defn tool-delete-production [{:keys [production_uuid]}]
-  (let [result (auphonic-request :delete (str "/production/" production_uuid ".json"))]
-    (if (:success result)
-      {:content [{:type "text"
-                 :text (str "✓ Production " production_uuid " deleted successfully")}]}
-      {:error (or (get-in result [:data :error_message])
-                 (:error result)
-                 "Failed to delete production")})))
+  (if-let [validation-error (validate-required-fields
+                             {:production_uuid production_uuid}
+                             [:production_uuid])]
+    {:error (:error validation-error)}
+
+    (let [result (auphonic-request :delete (str "/production/" production_uuid ".json"))]
+      (if (:success result)
+        {:content [{:type "text"
+                    :text (str "✓ Production " production_uuid " deleted successfully")}]}
+        {:error (or (get-in result [:data :error_message])
+                    (:error result)
+                    "Failed to delete production")}))))
 
 (defn tool-list-presets []
   (let [result (auphonic-request :get "/presets.json")]
     (if (:success result)
       (let [presets (get-in result [:data :data])
             formatted (str/join "\n\n"
-                        (map (fn [preset]
-                               (let [{:keys [uuid preset_name]} preset]
-                                 (str "• " preset_name "\n"
-                                      "  UUID: " uuid)))
-                             presets))]
+                                (map (fn [preset]
+                                       (let [{:keys [uuid preset_name]} preset]
+                                         (str "• " preset_name "\n"
+                                              "  UUID: " uuid)))
+                                     presets))]
         {:content [{:type "text"
-                   :text (str "Available presets:\n\n" formatted)}]
+                    :text (str "Available presets:\n\n" formatted)}]
          :presets presets})
       {:error (or (get-in result [:data :error_message])
-                 (:error result)
-                 "Failed to list presets")})))
+                  (:error result)
+                  "Failed to list presets")})))
 
 ;; ============================================================================
 ;; MCP Resources
@@ -230,29 +319,28 @@
 
 (defn resource-production-details [uuid]
   (let [result (auphonic-request :get (str "/production/" uuid ".json"))]
-    (if (:success result)
+    (when (:success result)
       {:uri (str "auphonic://production/" uuid)
        :mimeType "application/json"
-       :text (json/generate-string (get-in result [:data :data]) {:pretty true})}
-      nil)))
+       :text (json/generate-string (get-in result [:data :data]) {:pretty true})})))
 
 (defn resource-presets-list []
   (let [result (auphonic-request :get "/presets.json")]
-    (if (:success result)
+    (when (:success result)
       {:uri "auphonic://presets"
        :mimeType "application/json"
-       :text (json/generate-string (get-in result [:data :data]) {:pretty true})}
-      nil)))
+       :text (json/generate-string (get-in result [:data :data]) {:pretty true})})))
 
 (defn resource-config []
   {:uri "auphonic://config"
    :mimeType "application/json"
-   :text (json/generate-string 
-           {:api_endpoint auphonic-api-base
-            :shows show-types
-            :presets {:lup (get-preset-for-show "lup")
-                     :launch (get-preset-for-show "launch")}}
-           {:pretty true})})
+   :text (json/generate-string
+          {:api_endpoint auphonic-api-base
+           :shows show-types
+           :presets (into {} (map (fn [show]
+                                    [show (get-preset-for-show show)])
+                                  (keys show-types)))}
+          {:pretty true})})
 
 ;; ============================================================================
 ;; MCP Prompts
@@ -262,9 +350,9 @@
   {:messages
    [{:role "user"
      :content {:type "text"
-               :text (str "Please upload the audio file at " file_path 
-                         " for the " show " show as a " type " episode. "
-                         "After uploading, check the status and let me know when it's done processing.")}}]})
+               :text (str "Please upload the audio file at " file_path
+                          " for the " show " show as a " type " episode. "
+                          "After uploading, check the status and let me know when it's done processing.")}}]})
 
 (defn prompt-analyze-production [production_uuid]
   (if-let [resource (resource-production-details production_uuid)]
@@ -287,7 +375,7 @@
        [{:role "user"
          :content {:type "text"
                    :text (str "Check the status of these recent productions:\n"
-                             (str/join "\n" recent-uuids))}}]}
+                              (str/join "\n" recent-uuids))}}]}
       {:messages
        [{:role "user"
          :content {:type "text"
@@ -297,15 +385,11 @@
 ;; MCP Protocol Handlers
 ;; ============================================================================
 
-(defn handle-initialize [params]
-  (let [capabilities {:tools {:listChanged true}
-                     :resources {:subscribe true
-                                :listChanged true}
-                     :prompts {:listChanged true}}]
-    (swap! server-state assoc :initialized true :capabilities capabilities)
-    {:protocolVersion "2024-11-05"
-     :capabilities capabilities
-     :serverInfo server-info}))
+(defn handle-initialize [params session-id]
+  (update-session! session-id assoc :initialized true)
+  {:protocolVersion protocol-version
+   :capabilities capabilities
+   :serverInfo server-info})
 
 (defn handle-tools-list []
   {:tools
@@ -313,56 +397,55 @@
      :description "Upload an audio file to Auphonic for processing. Automatically starts processing with the show's preset."
      :inputSchema {:type "object"
                    :properties {:show {:type "string"
-                                      :enum ["lup" "launch"]
-                                      :description "The podcast show"}
-                               :type {:type "string"
-                                     :enum ["bootleg" "adfree" "main"]
-                                     :description "Type of episode"}
-                               :file_path {:type "string"
-                                          :description "Absolute path to the audio file"}
-                               :title {:type "string"
-                                      :description "Episode title (optional)"}
-                               :subtitle {:type "string"
-                                         :description "Episode subtitle (optional)"}
-                               :summary {:type "string"
-                                        :description "Episode summary (optional)"}}
+                                       :enum ["lup" "launch"]
+                                       :description "The podcast show"}
+                                :type {:type "string"
+                                       :description "Type of episode (bootleg, adfree, main - varies by show)"}
+                                :file_path {:type "string"
+                                            :description "Absolute path to the audio file"}
+                                :title {:type "string"
+                                        :description "Episode title (optional)"}
+                                :subtitle {:type "string"
+                                           :description "Episode subtitle (optional)"}
+                                :summary {:type "string"
+                                          :description "Episode summary (optional)"}}
                    :required ["show" "type" "file_path"]}}
-    
+
     {:name "check_status"
      :description "Check the processing status of an Auphonic production"
      :inputSchema {:type "object"
                    :properties {:production_uuid {:type "string"
                                                   :description "Production UUID from Auphonic"}}
                    :required ["production_uuid"]}}
-    
+
     {:name "list_productions"
      :description "List Auphonic productions with optional filtering"
      :inputSchema {:type "object"
                    :properties {:limit {:type "number"
-                                       :description "Maximum number of results (default 20)"}
-                               :offset {:type "number"
-                                       :description "Offset for pagination"}
-                               :status {:type "number"
-                                       :description "Filter by status: 0=Waiting, 1=Processing, 2=Error, 3=Done"}}}}
-    
+                                        :description "Maximum number of results (default 20)"}
+                                :offset {:type "number"
+                                         :description "Offset for pagination"}
+                                :status {:type "number"
+                                         :description "Filter by status: 0=Waiting, 1=Processing, 2=Error, 3=Done"}}}}
+
     {:name "download_output"
      :description "Download the processed audio file from a finished production"
      :inputSchema {:type "object"
                    :properties {:production_uuid {:type "string"
                                                   :description "Production UUID"}
-                               :output_path {:type "string"
-                                            :description "Directory to save the file"}
-                               :format {:type "string"
-                                       :description "Specific format to download (e.g., 'mp3', 'aac')"}}
+                                :output_path {:type "string"
+                                              :description "Directory to save the file"}
+                                :format {:type "string"
+                                         :description "Specific format to download (e.g., 'mp3', 'aac')"}}
                    :required ["production_uuid" "output_path"]}}
-    
+
     {:name "delete_production"
      :description "Delete an Auphonic production"
      :inputSchema {:type "object"
                    :properties {:production_uuid {:type "string"
                                                   :description "Production UUID to delete"}}
                    :required ["production_uuid"]}}
-    
+
     {:name "list_presets"
      :description "List all available Auphonic presets"
      :inputSchema {:type "object"}}]})
@@ -378,7 +461,7 @@
                  {:error (str "Unknown tool: " name)})]
     (if (:error result)
       {:content [{:type "text"
-                 :text (str "Error: " (:error result))}]
+                  :text (str "Error: " (:error result))}]
        :isError true}
       result)))
 
@@ -388,12 +471,12 @@
      :name "Auphonic Configuration"
      :description "API configuration and show settings"
      :mimeType "application/json"}
-    
+
     {:uri "auphonic://presets"
      :name "Available Presets"
      :description "List of all Auphonic presets"
      :mimeType "application/json"}
-    
+
     {:uri "auphonic://production/{uuid}"
      :name "Production Details"
      :description "Details of a specific production (URI template)"
@@ -403,14 +486,14 @@
   (let [resource (cond
                    (= uri "auphonic://config")
                    (resource-config)
-                   
+
                    (= uri "auphonic://presets")
                    (resource-presets-list)
-                   
+
                    (str/starts-with? uri "auphonic://production/")
                    (let [uuid (last (str/split uri #"/"))]
                      (resource-production-details uuid))
-                   
+
                    :else nil)]
     (if resource
       {:contents [resource]}
@@ -429,13 +512,13 @@
                  {:name "file_path"
                   :description "Path to audio file"
                   :required true}]}
-    
+
     {:name "analyze_production"
      :description "Analyze a production's status and readiness"
      :arguments [{:name "production_uuid"
                   :description "Production UUID to analyze"
                   :required true}]}
-    
+
     {:name "check_recent_uploads"
      :description "Check status of recently uploaded files"
      :arguments []}]})
@@ -444,123 +527,180 @@
   (case name
     "upload_and_process"
     (prompt-upload-and-process (:show arguments) (:type arguments) (:file_path arguments))
-    
+
     "analyze_production"
     (prompt-analyze-production (:production_uuid arguments))
-    
+
     "check_recent_uploads"
     (prompt-check-recent-uploads)
-    
+
     {:error (str "Unknown prompt: " name)}))
 
 ;; ============================================================================
 ;; JSON-RPC Handler
 ;; ============================================================================
 
-(defn handle-jsonrpc-request [request]
-  (let [{:keys [method params id]} request]
+(defn handle-jsonrpc-request [request session-id]
+  (let [{:keys [method params id]} request
+        session (get-session session-id)]
+
     (try
+      ;; Check if method requires initialization
+      (when (and (not= method "initialize")
+                 (not (:initialized session)))
+        (throw (ex-info "Session not initialized"
+                        {:type :session-error
+                         :code -32002})))
+
       (let [result (case method
-                     "initialize" (handle-initialize params)
+                     "initialize" (handle-initialize params session-id)
                      "tools/list" (handle-tools-list)
                      "tools/call" (handle-tools-call params)
                      "resources/list" (handle-resources-list)
                      "resources/read" (handle-resources-read params)
                      "prompts/list" (handle-prompts-list)
                      "prompts/get" (handle-prompts-get params)
-                     {:error {:code -32601
-                             :message (str "Method not found: " method)}})]
+                     (throw (ex-info "Method not found"
+                                     {:type :method-error
+                                      :code -32601
+                                      :method method})))]
         (if (:error result)
           {:jsonrpc "2.0"
            :id id
-           :error (:error result)}
+           :error {:code -32000
+                   :message (:error result)}}
           {:jsonrpc "2.0"
            :id id
            :result result}))
+
+      (catch clojure.lang.ExceptionInfo e
+        (let [data (ex-data e)]
+          {:jsonrpc "2.0"
+           :id id
+           :error {:code (or (:code data) -32603)
+                   :message (.getMessage e)
+                   :data data}}))
+
       (catch Exception e
         {:jsonrpc "2.0"
          :id id
          :error {:code -32603
-                :message (str "Internal error: " (.getMessage e))}}))))
+                 :message (str "Internal error: " (.getMessage e))}}))))
 
 ;; ============================================================================
-;; HTTP Server (for STDIO transport, we use stdin/stdout)
+;; HTTP Server
 ;; ============================================================================
 
 (defn parse-json-body [req]
   (when-let [body (:body req)]
-    (json/parse-string (slurp body) true)))
+    (try
+      (json/parse-string (slurp body) true)
+      (catch Exception e
+        (throw (ex-info "Invalid JSON" {:type :parse-error :code -32700}))))))
 
-(defn json-response [data & {:keys [status] :or {status 200}}]
-  {:status status
-   :headers {"Content-Type" "application/json"}
-   :body (json/generate-string data)})
+(defn validate-content-type [req]
+  (when-not (str/includes? (get-in req [:headers "content-type"] "") "application/json")
+    (throw (ex-info "Content-Type must be application/json"
+                    {:type :content-type-error :status 415}))))
+
+(defn validate-origin [req]
+  ;; Simple Origin validation to prevent DNS rebinding
+  (when-let [origin (get-in req [:headers "origin"])]
+    (when-not (or (str/includes? origin "localhost")
+                  (str/includes? origin "127.0.0.1"))
+      (throw (ex-info "Invalid origin" {:type :origin-error :status 403})))))
 
 (defn http-handler [req]
-  (let [{:keys [uri request-method]} req]
-    (case [request-method uri]
-      [:post "/mcp"]
-      (let [request (parse-json-body req)
-            response (handle-jsonrpc-request request)]
-        (json-response response))
-      
-      [:get "/health"]
-      (json-response {:status "ok" :server server-info})
-      
-      (json-response {:error "Not found"} :status 404))))
+  (let [{:keys [uri request-method headers]} req]
+    (try
+      (case [request-method uri]
+        [:post "/mcp"]
+        (do
+          (validate-origin req)
+          (validate-content-type req)
 
-;; ============================================================================
-;; STDIO Transport (Primary MCP transport)
-;; ============================================================================
+          (let [request (parse-json-body req)
+                session-id (or (get headers "mcp-session-id")
+                               (when (= (:method request) "initialize")
+                                 (create-session!)))]
 
-(defn stdio-loop []
-  "Read JSON-RPC messages from stdin, write responses to stdout"
-  (loop []
-    (when-let [line (read-line)]
-      (try
-        (let [request (json/parse-string line true)
-              response (handle-jsonrpc-request request)]
-          (println (json/generate-string response))
-          (flush))
-        (catch Exception e
-          (let [error-response {:jsonrpc "2.0"
-                               :id nil
-                               :error {:code -32700
-                                      :message (str "Parse error: " (.getMessage e))}}]
-            (println (json/generate-string error-response))
-            (flush))))
-      (recur))))
+            (when session-id
+              (if-let [rate-limit (check-rate-limit session-id)]
+                (throw (ex-info "Rate limit exceeded"
+                                {:type :rate-limit-error
+                                 :status 429
+                                 :retry-after (:retry-after rate-limit)}))
+                (record-request! session-id)))
+
+            (when-not session-id
+              (throw (ex-info "Missing session ID" {:type :session-error :status 400})))
+
+            (when-not (get-session session-id)
+              (throw (ex-info "Invalid session ID" {:type :session-error :status 404})))
+
+            (let [response (handle-jsonrpc-request request session-id)
+                  response-headers (cond-> {"Content-Type" "application/json"}
+                                     (and session-id (= (:method request) "initialize"))
+                                     (assoc "Mcp-Session-Id" session-id))]
+              {:status 200
+               :headers response-headers
+               :body (json/generate-string response)})))
+
+        [:delete "/mcp"]
+        (let [session-id (get headers "mcp-session-id")]
+          (when session-id
+            (delete-session! session-id))
+          {:status 200
+           :headers {"Content-Type" "application/json"}
+           :body (json/generate-string {:status "ok"})})
+
+        [:get "/health"]
+        {:status 200
+         :headers {"Content-Type" "application/json"}
+         :body (json/generate-string {:status "ok"
+                                      :server server-info
+                                      :sessions (count (:sessions @server-state))})}
+
+        {:status 404
+         :headers {"Content-Type" "application/json"}
+         :body (json/generate-string {:error "Not found"})})
+
+      (catch clojure.lang.ExceptionInfo e
+        (let [data (ex-data e)
+              status (or (:status data) 500)
+              headers (cond-> {"Content-Type" "application/json"}
+                        (:retry-after data) (assoc "Retry-After" (str (:retry-after data))))]
+          {:status status
+           :headers headers
+           :body (json/generate-string
+                  (if (= (:type data) :parse-error)
+                    {:jsonrpc "2.0"
+                     :id nil
+                     :error {:code (:code data)
+                             :message (.getMessage e)}}
+                    {:error (.getMessage e)}))}))
+
+      (catch Exception e
+        {:status 500
+         :headers {"Content-Type" "application/json"}
+         :body (json/generate-string {:error (str "Internal server error: " (.getMessage e))})}))))
 
 ;; ============================================================================
 ;; Main Entry Point
 ;; ============================================================================
 
 (defn -main [& args]
-  (let [mode (or (first args) "http")]
-    (cond
-      ;; STDIO mode (default for MCP)
-      (= mode "stdio")
-      (do
-        (binding [*out* *err*]
-          (println "Starting Auphonic MCP Server (STDIO mode)")
-          (println "Server:" (:name server-info) "v" (:version server-info)))
-        (stdio-loop))
-      
-      ;; HTTP mode (for debugging)
-      (= mode "http")
-      (let [port (Integer/parseInt (or (second args) "3000"))]
-        (server/run-server http-handler {:port port})
-        (println (str "Auphonic MCP Server running on http://localhost:" port))
-        (println "POST to /mcp for JSON-RPC requests")
-        (println "GET /health for health check")
-        @(promise))
-      
-      :else
-      (do
-        (println "Usage:")
-        (println "  auphonic-mcp-server stdio    # STDIO mode (default for MCP)")
-        (println "  auphonic-mcp-server http [port]  # HTTP mode for debugging")
-        (System/exit 1)))))
+  (let [port (if (seq args)
+               (Integer/parseInt (first args))
+               3000)]
+    (server/run-server http-handler {:port port})
+    (println (str "Auphonic MCP Server v" (:version server-info)))
+    (println (str "Protocol version: " protocol-version))
+    (println (str "Listening on http://localhost:" port))
+    (println "POST to /mcp for JSON-RPC requests")
+    (println "GET /health for health check")
+    (println "DELETE /mcp with Mcp-Session-Id to terminate session")
+    @(promise)))
 
 (when (= *file* (System/getProperty "babashka.file"))
   (apply -main *command-line-args*))
