@@ -7,7 +7,16 @@
          '[clojure.string :as str])
 
 ;; Configuration
-(def test-port 3002)
+(defn get-free-port []
+  (let [s (java.net.ServerSocket. 0)]
+    (.close s)
+    (.getLocalPort s)))
+
+(def test-port
+  (if-let [env-port (System/getenv "TEST_PORT")]
+    (Integer/parseInt env-port)
+    3002))
+
 (def server-url (str "http://localhost:" test-port))
 (def mcp-endpoint (str server-url "/mcp"))
 
@@ -47,6 +56,10 @@
   (when-let [p @server-process]
     (println "Stopping server...")
     (.destroy p)
+    (Thread/sleep 500)
+    (when (.isAlive p)
+      (println "Force killing server...")
+      (.destroyForcibly p))
     (reset! server-process nil)))
 
 (defn rpc-request [method params & [session-id]]
