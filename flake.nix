@@ -128,8 +128,10 @@
               };
 
               environmentFile = mkOption {
-                type = types.path;
+                type = types.nullOr types.path;
+                default = null;
                 description = "File containing AUPHONIC_API_KEY and AUPHONIC_PRESET_* variables";
+                example = "/etc/nixos/secrets/auphonic-mcp.env";
               };
 
               user = mkOption {
@@ -166,9 +168,9 @@
                   ProtectSystem = "strict";
                   ProtectHome = true;
                   ReadWritePaths = [];
-                };
 
-                environmentFile = cfg.environmentFile;
+                  EnvironmentFile = cfg.environmentFile;
+                };
               };
 
               networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [cfg.port];
