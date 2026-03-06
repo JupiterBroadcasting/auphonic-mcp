@@ -281,6 +281,19 @@
         (t/is (true? (get-in body [:result :isError])))
         (t/is (some? (re-find #"not found" (str body))) "Error message should mention file not found")))
 
+    (t/testing "upload_audio with custom preset validation"
+      (let [temp-file (java.io.File/createTempFile "test-preset" ".mp3")
+            _ (.deleteOnExit temp-file)
+            _ (spit temp-file "fake audio")
+            resp (rpc-request "tools/call"
+                              {:name "upload_audio"
+                               :arguments {:show "lup" :type "bootleg" :file_path (.getAbsolutePath temp-file) :preset ""}}
+                              session-id)
+            body (:body resp)
+            error-msg (get-in body [:result :content 0 :text])]
+        (t/is (true? (get-in body [:result :isError])) "Empty preset should trigger validation error")
+        (t/is (some? (re-find #"Preset must not be empty" (str error-msg))))))
+
     (t/testing "upload_audio with valid temp file returns result"
       (let [temp-file (java.io.File/createTempFile "test-upload" ".mp3")
             _ (.deleteOnExit temp-file)

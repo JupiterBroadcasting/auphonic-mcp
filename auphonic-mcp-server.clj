@@ -104,6 +104,10 @@
   (when-not (fs/exists? path)
     {:error (str "File not found: " path)}))
 
+(defn validate-preset [preset]
+  (when (str/blank? (str preset))
+    {:error "Preset must not be empty"}))
+
 (defn validate-required-fields [args required-fields]
   (let [missing (remove #(contains? args %) required-fields)]
     (when (seq missing)
@@ -149,49 +153,52 @@
 ;; MCP Tool Implementations
 ;; ============================================================================
 
-(defn tool-upload-audio [{:keys [show type file_path title subtitle summary]}]
-  (if-let [validation-error (or (validate-required-fields
-                                 {:show show :type type :file_path file_path}
-                                 [:show :type :file_path])
-                                (validate-show show)
-                                (validate-type show type)
-                                (validate-file-exists file_path))]
-    {:error (:error validation-error)}
+(defn tool-upload-audio [args]
+  (let [{:keys [show type file_path title subtitle summary preset]} args]
+    (if-let [validation-error (or (validate-required-fields
+                                   {:show show :type type :file_path file_path}
+                                   [:show :type :file_path])
+                                  (validate-show show)
+                                  (validate-type show type)
+                                  (validate-file-exists file_path)
+                                  (when (contains? args :preset)
+                                    (validate-preset preset)))]
+      {:error (:error validation-error)}
 
-    (if-let [preset (get-preset-for-show show)]
-      (let [filename (fs/file-name file_path)
-            title (or title (str (str/upper-case show) " - " filename))
-            api-key (get-api-key)
-            url (str auphonic-api-base "/simple/productions.json")
-            multipart-parts (cond-> [{:name "preset" :content preset}
-                                     {:name "title" :content title}
-                                     {:name "input_file" :content (io/file file_path)}
-                                     {:name "action" :content "start"}]
-                              subtitle (conj {:name "subtitle" :content subtitle})
-                              summary (conj {:name "summary" :content summary}))]
+      (if-let [preset-to-use (or preset (get-preset-for-show show))]
+        (let [filename (fs/file-name file_path)
+              title (or title (str (str/upper-case show) " - " filename))
+              api-key (get-api-key)
+              url (str auphonic-api-base "/simple/productions.json")
+              multipart-parts (cond-> [{:name "preset" :content preset-to-use}
+                                       {:name "title" :content title}
+                                       {:name "input_file" :content (io/file file_path)}
+                                       {:name "action" :content "start"}]
+                                subtitle (conj {:name "subtitle" :content subtitle})
+                                summary (conj {:name "summary" :content summary}))]
 
-        (try
-          (let [response (http/post url
-                                    {:headers {"Authorization" (str "Bearer " api-key)}
-                                     :multipart multipart-parts
-                                     :throw false})]
-            (if (< (:status response) 300)
-              (let [data (json/parse-string (:body response) true)
-                    production (:data data)
-                    uuid (:uuid production)]
-                (track-production! uuid)
-                {:content [{:type "text"
-                            :text (str "✓ Upload started successfully!\n"
-                                       "Production UUID: " uuid "\n"
-                                       "Status: " (:status_string production) "\n"
-                                       "View: https://auphonic.com/production/" uuid)}]
-                 :production_uuid uuid})
-              {:error (str "Upload failed: HTTP " (:status response))}))
-          (catch Exception e
-            {:error (str "Upload failed: " (.getMessage e))})))
+          (try
+            (let [response (http/post url
+                                      {:headers {"Authorization" (str "Bearer " api-key)}
+                                       :multipart multipart-parts
+                                       :throw false})]
+              (if (< (:status response) 300)
+                (let [data (json/parse-string (:body response) true)
+                      production (:data data)
+                      uuid (:uuid production)]
+                  (track-production! uuid)
+                  {:content [{:type "text"
+                              :text (str "✓ Upload started successfully!\n"
+                                         "Production UUID: " uuid "\n"
+                                         "Status: " (:status_string production) "\n"
+                                         "View: https://auphonic.com/production/" uuid)}]
+                   :production_uuid uuid})
+                {:error (str "Upload failed: HTTP " (:status response))}))
+            (catch Exception e
+              {:error (str "Upload failed: " (.getMessage e))})))
 
-      {:error (str "AUPHONIC_PRESET_" (str/upper-case show)
-                   " environment variable not set")})))
+        {:error (str "AUPHONIC_PRESET_" (str/upper-case show)
+                     " environment variable not set")}))))
 
 (defn tool-check-status [{:keys [production_uuid]}]
   (if-let [validation-error (validate-required-fields
@@ -385,7 +392,7 @@
 ;; MCP Protocol Handlers
 ;; ============================================================================
 
-(defn handle-initialize [params session-id]
+(defn handle-initialize [session-id]
   (update-session! session-id assoc :initialized true)
   {:protocolVersion protocol-version
    :capabilities capabilities
@@ -408,7 +415,9 @@
                                 :subtitle {:type "string"
                                            :description "Episode subtitle (optional)"}
                                 :summary {:type "string"
-                                          :description "Episode summary (optional)"}}
+                                          :description "Episode summary (optional)"}
+                                :preset {:type "string"
+                                         :description "Optional preset UUID to use instead of show default"}}
                    :required ["show" "type" "file_path"]}}
 
     {:name "check_status"
@@ -553,7 +562,7 @@
                          :code -32002})))
 
       (let [result (case method
-                     "initialize" (handle-initialize params session-id)
+                     "initialize" (handle-initialize session-id)
                      "tools/list" (handle-tools-list)
                      "tools/call" (handle-tools-call params)
                      "resources/list" (handle-resources-list)
@@ -595,7 +604,7 @@
   (when-let [body (:body req)]
     (try
       (json/parse-string (slurp body) true)
-      (catch Exception e
+      (catch Exception _
         (throw (ex-info "Invalid JSON" {:type :parse-error :code -32700}))))))
 
 (defn validate-content-type [req]
@@ -680,10 +689,10 @@
                              :message (.getMessage e)}}
                     {:error (.getMessage e)}))}))
 
-      (catch Exception e
+      (catch Exception _
         {:status 500
          :headers {"Content-Type" "application/json"}
-         :body (json/generate-string {:error (str "Internal server error: " (.getMessage e))})}))))
+         :body (json/generate-string {:error "Internal server error"})}))))
 
 ;; ============================================================================
 ;; Main Entry Point
@@ -696,7 +705,7 @@
   (println "POST to /mcp for JSON-RPC requests")
   (println "GET /health for health check")
   (println "DELETE /mcp with Mcp-Session-Id to terminate session")
-  (server/run-server http-handler {:port port}))
+  (server/run-server http-handler {:host "0.0.0.0" :port port}))
 
 (defn stop-server! [server]
   (server/server-stop! server))
