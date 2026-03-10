@@ -149,6 +149,20 @@
         (catch Exception e
           {:success false :error (str "Request failed: " (.getMessage e))})))))
 
+(def output-formats-cache (atom nil))
+
+(defn get-available-output-formats []
+  (when-not @output-formats-cache
+    (let [result (auphonic-request :get "/info/output_files.json")]
+      (when (:success result)
+        (reset! output-formats-cache (keys (get-in result [:data :data]))))))
+  @output-formats-cache)
+
+(defn format-available-formats []
+  (if-let [formats (get-available-output-formats)]
+    (str/join ", " formats)
+    "mp3, aac, opus, flac, vtt, srt, html (see /api/info/output_files.json)"))
+
 ;; ============================================================================
 ;; MCP Tool Implementations
 ;; ============================================================================
@@ -265,7 +279,9 @@
           (if (= 3 status)
             (let [output-files (:output_files production)
                   file (if format
-                         (first (filter #(= format (:format %)) output-files))
+                         (first (or
+                                 (filter #(= format (:format %)) output-files)
+                                 (filter #(= format (:ending %)) output-files)))
                          (first output-files))]
               (if file
                 (let [download-url (:download_url file)
@@ -283,7 +299,8 @@
                     (catch Exception e
                       {:error (str "Download failed: " (.getMessage e))})))
                 {:error (str "No output file found"
-                             (when format (str " with format: " format)))}))
+                             (when format (str " with format/ending: " format ". "))
+                             "Available: " (format-available-formats))}))
             {:error (str "Production not finished yet. Status: " (:status_string production))}))
         {:error (or (get-in result [:data :error_message])
                     (:error result)
@@ -445,7 +462,7 @@
                                 :output_path {:type "string"
                                               :description "Directory to save the file"}
                                 :format {:type "string"
-                                         :description "Specific format to download (e.g., 'mp3', 'aac')"}}
+                                         :description "Format to download: audio (mp3, aac, opus, flac) or transcript (vtt, srt, html). Matches format name or file extension."}}
                    :required ["production_uuid" "output_path"]}}
 
     {:name "delete_production"
