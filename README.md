@@ -62,6 +62,8 @@ Pre-configured shows:
 
 Add more shows by editing `show-types` in server file.
 
+Preset-only uploads are also supported. When a client passes `preset` directly to `upload_audio`, the server no longer requires `show` or `type`.
+
 ## MCP Capabilities
 
 ### Tools (6)
@@ -76,6 +78,16 @@ Add more shows by editing `show-types` in server file.
      "title": "Optional title",
      "subtitle": "Optional subtitle",
      "summary": "Optional summary"
+   }
+   ```
+
+   Or use a direct preset UUID without `show` or `type`:
+
+   ```json
+   {
+     "file_path": "/absolute/path/to/file.mp3",
+     "preset": "fzGATFDXZpuG6SCg8K8Aj9",
+     "title": "Optional title"
    }
    ```
 
@@ -602,4 +614,3 @@ curl -H "Authorization: Bearer $AUPHONIC_API_KEY" \
 ## License
 
 MIT
-

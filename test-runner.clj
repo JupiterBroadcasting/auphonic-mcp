@@ -173,6 +173,26 @@
         (t/is (= "auphonic://config" (get-in contents [0 :uri])))
         (t/is (= "application/json" (get-in contents [0 :mimeType])))))))
 
+(t/deftest test-preset-only-upload-validation
+  (t/testing "Preset-only uploads require only file_path and preset"
+    (let [tmp-file (.getAbsolutePath (doto (java.io.File/createTempFile "auphonic-mcp" ".mp3")
+                                       (.deleteOnExit)))]
+      (with-redefs [get-api-key (constantly "test-key")
+                    http/post (fn [_ _]
+                                {:status 200
+                                 :body (json/generate-string
+                                        {:data {:uuid "preset-only-uuid"
+                                                :status_string "Processing"}})})]
+        (let [result (tool-upload-audio {:file_path tmp-file
+                                         :preset "preset-uuid"
+                                         :title "Preset Only"})]
+          (t/is (= "preset-only-uuid" (:production_uuid result)))
+          (t/is (not (contains? result :error)))))))
+
+  (t/testing "Preset-only uploads still validate missing file_path"
+    (let [result (tool-upload-audio {:preset "preset-uuid"})]
+      (t/is (= "Missing required fields: file_path" (:error result))))))
+
 (t/deftest test-resources-list
   (let [init-resp (rpc-request "initialize"
                                {:protocolVersion "2025-03-26"
