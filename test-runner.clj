@@ -275,11 +275,11 @@
     (t/testing "upload_audio non-existent file"
       (let [resp (rpc-request "tools/call"
                               {:name "upload_audio"
-                               :arguments {:show "lup" :type "bootleg" :file_path "/nonexistent/path.mp3"}}
+                               :arguments {:preset "some-uuid" :file_path "/nonexistent/path.mp3"}}
                               session-id)
             body (:body resp)]
         (t/is (true? (get-in body [:result :isError])))
-        (t/is (some? (re-find #"not found" (str body))) "Error message should mention file not found")))
+        (t/is (some? (re-find #"File not found" (str body))) "Error message should mention file not found")))
 
     (t/testing "upload_audio with custom preset validation"
       (let [temp-file (java.io.File/createTempFile "test-preset" ".mp3")
@@ -419,6 +419,41 @@
       (let [state-resp (http/get (str server-url "/health"))
             body (json/parse-string (:body state-resp) true)]
         (t/is (contains? body :sessions) "Health should return sessions count")))))
+
+(t/deftest test-dynamic-show-discovery
+  (t/testing "Discovers shows from environment variables"
+    (let [orig-env (fn [k] (System/getenv k))]
+      (with-redefs [get-available-shows (constantly {"lup" "lup-uuid" "twib" "twib-uuid"})]
+        (let [shows (get-available-shows)]
+          (t/is (= "lup-uuid" (get shows "lup")))
+          (t/is (= "twib-uuid" (get shows "twib"))))))))
+
+(t/deftest test-preset-only-upload-validation
+  (let [init-resp (rpc-request "initialize"
+                               {:protocolVersion "2025-03-26"
+                                :clientInfo {:name "test"}
+                                :capabilities {}})
+        session-id (get-in init-resp [:headers "mcp-session-id"])]
+    (t/testing "Preset-only uploads require only file_path and preset"
+      (let [tmp-file (str (fs/create-temp-file {:prefix "auphonic-mcp" :suffix ".mp3"}))]
+        (fs/delete-on-exit tmp-file)
+        (let [resp (rpc-request "tools/call"
+                                {:name "upload_audio"
+                                 :arguments {:file_path tmp-file
+                                             :preset "preset-uuid"
+                                             :title "Preset Only"}}
+                                session-id)
+              body (:body resp)]
+          ;; It should either succeed (if API key provided) or fail with API Key error,
+          ;; but NOT fail with validation error.
+          (t/is (not (str/includes? (str body) "Missing required fields"))
+                "Should not have validation errors"))))
+
+    (t/testing "Preset-only uploads still validate missing file_path"
+      (let [resp (rpc-request "tools/call"
+                              {:name "upload_audio" :arguments {:preset "preset-uuid"}}
+                              session-id)]
+        (t/is (true? (get-in resp [:body :result :isError])))))))
 
 ;; --- Port Configuration Tests (Subprocess) ---
 

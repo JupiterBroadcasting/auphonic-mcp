@@ -11,19 +11,6 @@ A Babashka Streamable HTTP MCP server wrapping the Auphonic API. It provides too
 **Endpoint:** Single `/mcp` POST + `/health`
 **Compatible with:** mcp-injector `{:auphonic {:url "http://127.0.0.1:PORT/mcp"}}`
 
-## Project Structure
-
-```
-auphonic-mcp/
-├── auphonic-mcp-server.clj  # Single-file MCP server (the whole thing)
-├── flake.nix                # Nix package
-├── README.md                # Project overview
-├── AGENTS.md                # This file (philosophy & workflows)
-├── docs/
-│   └── AUPHONIC_API.md      # API documentation reference
-└── tests/                   # (Planned) Integration tests
-```
-
 ## Philosophy: Grumpy Pragmatism
 
 We follow the same principles as `mcp-injector` and `art19-mcp`:
@@ -32,6 +19,60 @@ We follow the same principles as `mcp-injector` and `art19-mcp`:
 - **One File is Fine** — The server lives in `auphonic-mcp-server.clj`. Don't split until complexity demands it.
 - **Test-First Design** — (In progress) Use real in-process servers for integration tests.
 - **YAGNI** — Don't build for imagined futures. Abstractions are a cost.
+
+### Loves to Ship Pragmatism
+
+Balance high quality bars with the absolute necessity of delivering functional software. We raise the bar on code, but we don't let "perfect" be the enemy of "shipped." Prioritize reliability and observability while maintaining high velocity.
+
+## Learning: Simple vs. Easy (Hickey)
+
+- **Simple** = coherent, understandable, non-intertwined components that promote reliability
+- **Easy** = familiar, proximity, convenient short-term choices that often lead to complexity
+- Choose simplicity deliberately through design and architecture
+
+## Learning: Research-First (mcp-injector)
+
+Before implementing:
+1. Ask: "Does this already exist?"
+2. Research ecosystem solutions
+3. Specify with acceptance criteria and edge cases
+4. Break into staged PRs
+
+## Learning: Metamorphic Testing (Hillel Wayne)
+
+Test properties and relationships rather than exact outputs:
+- What invariants hold regardless of implementation?
+- How does output change with input transformations?
+- Verify correctness through relationships, not hardcoded expected values
+
+## Learning: Data-Driven Simplicity (Eric Normand)
+
+- Think in data structures and transformations
+- Keep dependencies minimal and explicit
+- Favor composable, functional approaches over imperative state
+- Avoid conflating data, behavior, and state unnecessarily
+
+## Review Sub-Agent Guidelines
+
+### Grumpy Senior Reality Check
+- What could go wrong in production that isn't covered?
+- Have we tested edge cases or just the happy path?
+- What's the simplest solution that actually works?
+- What assumptions may not hold under load/real data?
+- How hard is it to debug and fix at 3 AM?
+
+### Loves to Ship Mindset
+- Assume a hostile production environment but maintain delivery velocity.
+- Prioritize rollback speed and observability to enable faster shipping.
+- Focus on simple, functional solutions that can be iteratively improved.
+
+### Review Checkpoints
+- [ ] Simple vs. easy: Is this the simplest coherent solution?
+- [ ] Research: Does existing tooling solve this?
+- [ ] Properties: Can we verify correctness through invariants?
+- [ ] Production: Monitoring, rollback, error paths covered?
+- [ ] YAGNI: Are we building for hypothetical futures?
+- [ ] Data: Are transformations explicit and minimal?
 
 ## Workflow
 
@@ -82,3 +123,5 @@ export AUPHONIC_PRESET_LAUNCH="preset-uuid"
 - **Session Handling**: mcp-injector expects `Mcp-Session-Id` header. The server validates this session on every request after initialization.
 - **Rate Limiting**: Simple in-memory rate limiting is implemented (60 requests/min).
 - **Multipart Uploads**: Uses `babashka.http-client` with `io/file` for efficient audio uploads.
+- **Production Resilience**: Loves to ship mentality — assume production will be hostile, prioritize observability and rapid rollback.
+- **Review Philosophy**: Grumpy senior perspective with data-driven, property-based testing approach.

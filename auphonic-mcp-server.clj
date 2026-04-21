@@ -22,10 +22,6 @@
 
 (def ^:const auphonic-api-base "https://auphonic.com/api")
 
-(def ^:const show-types
-  {"lup" ["bootleg" "adfree" "main"]
-   "launch" ["bootleg" "main"]})
-
 (def ^:const capabilities
   {:tools {:listChanged false}
    :resources {:subscribe false :listChanged false}
@@ -88,17 +84,22 @@
 (defn get-api-key []
   (System/getenv "AUPHONIC_API_KEY"))
 
-(defn get-preset-for-show [show]
-  (System/getenv (str "AUPHONIC_PRESET_" (str/upper-case show))))
-
-(defn validate-show [show]
-  (when-not (contains? show-types show)
-    {:error (str "Invalid show. Must be one of: " (str/join ", " (keys show-types)))}))
-
-(defn validate-type [show type]
-  (when-not (some #{type} (get show-types show))
-    {:error (str "Invalid type for show " show ". Valid types: "
-                 (str/join ", " (get show-types show)))}))
+(defn get-available-shows
+  "Discovers shows from environment variables starting with AUPHONIC_PRESET_"
+  []
+  (->> (System/getenv)
+       (filter (fn [[k _]] (str/starts-with? k "AUPHONIC_PRESET_")))
+       (map (fn [[k v]]
+              (let [show-name (str/lower-case (str/replace k "AUPHONIC_PRESET_" ""))]
+                [show-name v])))
+       ;; Security & Robustness: Filter keys and values
+       (filter (fn [[k v]]
+                 (and (not (str/blank? k))
+                      (not (str/blank? (str v)))
+                      (re-matches #"^[a-z0-9_]+$" k)
+                      (not (re-find #"(?i)key|secret|token|password" k))
+                      (< (count k) 64))))
+       (into {})))
 
 (defn validate-file-exists [path]
   (when-not (fs/exists? path)
@@ -109,7 +110,10 @@
     {:error "Preset must not be empty"}))
 
 (defn validate-required-fields [args required-fields]
-  (let [missing (remove #(contains? args %) required-fields)]
+  (let [missing (remove #(let [value (get args % ::missing)]
+                           (and (not= value ::missing)
+                                (not (nil? value))))
+                        required-fields)]
     (when (seq missing)
       {:error (str "Missing required fields: " (str/join ", " (map name missing)))})))
 
@@ -168,51 +172,55 @@
 ;; ============================================================================
 
 (defn tool-upload-audio [args]
-  (let [{:keys [show type file_path title subtitle summary preset]} args]
-    (if-let [validation-error (or (validate-required-fields
-                                   {:show show :type type :file_path file_path}
-                                   [:show :type :file_path])
-                                  (validate-show show)
-                                  (validate-type show type)
+  (let [{:keys [show type file_path title subtitle summary preset]} args
+        normalized-show (some-> show str/lower-case)
+        shows (get-available-shows)
+        ;; Resolve the preset: Direct UUID > Env-var Show Name
+        preset-to-use (or preset (get shows normalized-show))]
+    (if-let [validation-error (or (validate-required-fields args [:file_path])
+                                  (when (contains? args :preset) (validate-preset preset))
+                                  (when-not preset-to-use
+                                    {:error (if show
+                                              (str "Unknown show '" show "'. Configure AUPHONIC_PRESET_" (str/upper-case show) "=<PRESET_UUID> or use 'preset' argument.")
+                                              "Missing 'preset' or 'show' argument.")})
                                   (validate-file-exists file_path)
-                                  (when (contains? args :preset)
-                                    (validate-preset preset)))]
+                                  (let [size (fs/size file_path)]
+                                    (when (> size (* 2 1024 1024 1024)) ; 2GB limit
+                                      {:error (str "File too large (" (int (/ size 1024 1024)) "MB). Max limit is 2GB.")})))]
       {:error (:error validation-error)}
 
-      (if-let [preset-to-use (or preset (get-preset-for-show show))]
-        (let [filename (fs/file-name file_path)
-              title (or title (str (str/upper-case show) " - " filename))
-              api-key (get-api-key)
-              url (str auphonic-api-base "/simple/productions.json")
-              multipart-parts (cond-> [{:name "preset" :content preset-to-use}
-                                       {:name "title" :content title}
-                                       {:name "input_file" :content (io/file file_path)}
-                                       {:name "action" :content "start"}]
-                                subtitle (conj {:name "subtitle" :content subtitle})
-                                summary (conj {:name "summary" :content summary}))]
-
-          (try
-            (let [response (http/post url
-                                      {:headers {"Authorization" (str "Bearer " api-key)}
-                                       :multipart multipart-parts
-                                       :throw false})]
-              (if (< (:status response) 300)
-                (let [data (json/parse-string (:body response) true)
-                      production (:data data)
-                      uuid (:uuid production)]
-                  (track-production! uuid)
-                  {:content [{:type "text"
-                              :text (str "✓ Upload started successfully!\n"
-                                         "Production UUID: " uuid "\n"
-                                         "Status: " (:status_string production) "\n"
-                                         "View: https://auphonic.com/production/" uuid)}]
-                   :production_uuid uuid})
-                {:error (str "Upload failed: HTTP " (:status response))}))
-            (catch Exception e
-              {:error (str "Upload failed: " (.getMessage e))})))
-
-        {:error (str "AUPHONIC_PRESET_" (str/upper-case show)
-                     " environment variable not set")}))))
+      (let [filename (fs/file-name file_path)
+            title (or title (str (if normalized-show (str/upper-case normalized-show) "AUPHONIC") " - " filename))
+            url (str auphonic-api-base "/simple/productions.json")
+            multipart-parts (cond-> [{:name "preset" :content preset-to-use}
+                                     {:name "title" :content title}
+                                     {:name "input_file" :content (io/file file_path)}
+                                     {:name "action" :content "start"}]
+                              subtitle (conj {:name "subtitle" :content subtitle})
+                              summary (conj {:name "summary" :content summary})
+                              type (conj {:name "tags" :content type}))]
+        (try
+          (let [api-key (get-api-key)
+                response (http/post url
+                                    {:headers {"Authorization" (str "Bearer " api-key)}
+                                     :multipart multipart-parts
+                                     :timeout 300000 ; 5 minute timeout for large uploads
+                                     :throw false})]
+            (if (< (:status response) 300)
+              (let [data (json/parse-string (:body response) true)
+                    production (:data data)
+                    uuid (:uuid production)]
+                (track-production! uuid)
+                {:content [{:type "text"
+                            :text (str "✓ Upload started successfully!\n"
+                                       "Production UUID: " uuid "\n"
+                                       "Status: " (:status_string production) "\n"
+                                       "View: https://auphonic.com/production/" uuid)}]
+                 :production_uuid uuid})
+              (let [body (try (json/parse-string (:body response) true) (catch Exception _ nil))]
+                {:error (str "Upload failed (HTTP " (:status response) "): " (or (:error_message body) (:body response)))})))
+          (catch Exception e
+            {:error (str "Upload failed: " (.getMessage e))}))))))
 
 (defn tool-check-status [{:keys [production_uuid]}]
   (if-let [validation-error (validate-required-fields
@@ -358,25 +366,28 @@
 (defn resource-config []
   {:uri "auphonic://config"
    :mimeType "application/json"
-   :text (json/generate-string
-          {:api_endpoint auphonic-api-base
-           :shows show-types
-           :presets (into {} (map (fn [show]
-                                    [show (get-preset-for-show show)])
-                                  (keys show-types)))}
-          {:pretty true})})
+   :text (let [shows (get-available-shows)]
+           (json/generate-string
+            {:api_endpoint auphonic-api-base
+             :available_presets shows
+             :info "Available show presets are configured via AUPHONIC_PRESET_<NAME> environment variables."}
+            {:pretty true}))})
 
 ;; ============================================================================
 ;; MCP Prompts
 ;; ============================================================================
 
-(defn prompt-upload-and-process [show type file_path]
-  {:messages
-   [{:role "user"
-     :content {:type "text"
-               :text (str "Please upload the audio file at " file_path
-                          " for the " show " show as a " type " episode. "
-                          "After uploading, check the status and let me know when it's done processing.")}}]})
+(defn prompt-upload-and-process
+  ([file_path] (prompt-upload-and-process nil file_path))
+  ([show file_path]
+   (let [shows (get-available-shows)
+         resolved-show (or (some-> show str/lower-case) (first (sort (keys shows))) "SHOW_NAME")]
+     {:messages
+      [{:role "user"
+        :content {:type "text"
+                  :text (str "Please upload the audio file at " file_path
+                             " to Auphonic using the " resolved-show " preset."
+                             " You can set the title and summary if you have that information.")}}]})))
 
 (defn prompt-analyze-production [production_uuid]
   (if-let [resource (resource-production-details production_uuid)]
@@ -418,24 +429,23 @@
 (defn handle-tools-list []
   {:tools
    [{:name "upload_audio"
-     :description "Upload an audio file to Auphonic for processing. Automatically starts processing with the show's preset."
+     :description "Upload an audio file to Auphonic. Use 'show' (mapped via AUPHONIC_PRESET_SHOW environment variable) or 'preset' (direct UUID). Any 'type' provided is added as a tag."
      :inputSchema {:type "object"
                    :properties {:show {:type "string"
-                                       :enum ["lup" "launch"]
-                                       :description "The podcast show"}
-                                :type {:type "string"
-                                       :description "Type of episode (bootleg, adfree, main - varies by show)"}
+                                       :description "Show name (e.g. 'lup', 'twib'). Resolves to AUPHONIC_PRESET_<SHOW>."}
+                                :preset {:type "string"
+                                         :description "Direct Auphonic Preset UUID. Overrides 'show' if both provided."}
                                 :file_path {:type "string"
                                             :description "Absolute path to the audio file"}
+                                :type {:type "string"
+                                       :description "Episode type or category (e.g. 'bootleg', 'main'). Added as a tag."}
                                 :title {:type "string"
                                         :description "Episode title (optional)"}
                                 :subtitle {:type "string"
                                            :description "Episode subtitle (optional)"}
                                 :summary {:type "string"
-                                          :description "Episode summary (optional)"}
-                                :preset {:type "string"
-                                         :description "Optional preset UUID to use instead of show default"}}
-                   :required ["show" "type" "file_path"]}}
+                                          :description "Episode summary (optional)"}}
+                   :required ["file_path"]}}
 
     {:name "check_status"
      :description "Check the processing status of an Auphonic production"
@@ -486,9 +496,11 @@
                  "list_presets" (tool-list-presets)
                  {:error (str "Unknown tool: " name)})]
     (if (:error result)
-      {:content [{:type "text"
-                  :text (str "Error: " (:error result))}]
-       :isError true}
+      (let [error-msg (str "Error: " (:error result))]
+        {:content [{:type "text"
+                    :text error-msg}]
+         :isError true
+         :error-msg error-msg}) ; Add for test visibility
       result)))
 
 (defn handle-resources-list []
@@ -522,7 +534,11 @@
 
                    :else nil)]
     (if resource
-      {:contents [resource]}
+      (if (map? resource)
+        {:contents [resource]}
+        {:contents [{:uri uri
+                     :mimeType "text/plain"
+                     :text resource}]})
       {:error (str "Resource not found: " uri)})))
 
 (defn handle-prompts-list []
@@ -530,11 +546,8 @@
    [{:name "upload_and_process"
      :description "Guide through uploading and processing an audio file"
      :arguments [{:name "show"
-                  :description "Show name (lup or launch)"
-                  :required true}
-                 {:name "type"
-                  :description "Episode type (bootleg, main, or adfree)"
-                  :required true}
+                  :description "Show name (e.g. lup, launch)"
+                  :required false}
                  {:name "file_path"
                   :description "Path to audio file"
                   :required true}]}
@@ -550,17 +563,21 @@
      :arguments []}]})
 
 (defn handle-prompts-get [{:keys [name arguments]}]
-  (case name
-    "upload_and_process"
-    (prompt-upload-and-process (:show arguments) (:type arguments) (:file_path arguments))
+  (let [result (case name
+                 "upload_and_process"
+                 (prompt-upload-and-process (:show arguments) (:file_path arguments))
 
-    "analyze_production"
-    (prompt-analyze-production (:production_uuid arguments))
+                 "analyze_production"
+                 (prompt-analyze-production (:production_uuid arguments))
 
-    "check_recent_uploads"
-    (prompt-check-recent-uploads)
+                 "check_recent_uploads"
+                 (prompt-check-recent-uploads)
 
-    {:error (str "Unknown prompt: " name)}))
+                 {:error (str "Unknown prompt: " name)})]
+    (if (:error result)
+      result
+      ;; Ensure we return the MCP prompt structure correctly
+      (update result :messages (fn [msgs] (or msgs []))))))
 
 ;; ============================================================================
 ;; JSON-RPC Handler
