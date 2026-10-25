@@ -153,6 +153,43 @@
         (catch Exception e
           {:success false :error (str "Request failed: " (.getMessage e))})))))
 
+(defn auphonic-json-post
+  "POST a JSON body to the Auphonic API (Content-Type: application/json).
+
+   Distinct from auphonic-request, which form-encodes. Used for the JSON API
+   endpoints (/productions.json) where the payload is a nested structure."
+  [endpoint payload]
+  (let [api-key (get-api-key)]
+    (if-not api-key
+      {:success false :error "AUPHONIC_API_KEY not set"}
+      (try
+        (let [response (http/post (str auphonic-api-base endpoint)
+                                  {:headers {"Authorization" (str "Bearer " api-key)
+                                             "Content-Type" "application/json"}
+                                   :body (json/generate-string payload)
+                                   :timeout 60000
+                                   :throw false})]
+          (cond
+            (< (:status response) 300)
+            {:success true :data (json/parse-string (:body response) true)}
+
+            (= 401 (:status response))
+            {:success false :error "Authentication failed. Check API key."}
+
+            (= 404 (:status response))
+            {:success false :error "Resource not found"}
+
+            :else
+            (let [body (try (json/parse-string (:body response) true)
+                            (catch Exception _ nil))
+                  detail (or (:error_message body) (:message body))]
+              {:success false
+               :error (str "API error: HTTP " (:status response)
+                           (when (and detail (not (str/blank? (str detail))))
+                             (str " - " detail)))})))
+        (catch Exception e
+          {:success false :error (str "Request failed: " (.getMessage e))})))))
+
 (def output-formats-cache (atom nil))
 
 (defn get-available-output-formats []
@@ -166,6 +203,255 @@
   (if-let [formats (get-available-output-formats)]
     (str/join ", " formats)
     "mp3, aac, opus, flac, vtt, srt, html (see /api/info/output_files.json)"))
+
+;; ============================================================================
+;; External Services & Stem Resolution
+;;
+;; Auphonic can pull input audio from a registered external service (WebDAV,
+;; S3, ...) instead of receiving an upload. For multitrack that is the whole
+;; game: the stems already live on the service, so starting a production is a
+;; single JSON POST referencing them by filename.
+;; ============================================================================
+
+(defn percent-decode
+  "Percent-decode a filename from the service listing, WITHOUT form semantics.
+
+   The listing really does percent-encode (verified against the live API:
+   \"Linux%20Unplugged%20618%20(Ads)%20-%20Brent.flac\"), so decoding is required.
+
+   But java.net.URLDecoder is a *form* decoder: it turns '+' into a space, which
+   would silently corrupt a legal filename like \"C++ interview.flac\" and send
+   the mangled name back as that track's input_file. Escape any literal '+' to
+   %2B first, so only real %XX escapes are decoded, while keeping URLDecoder's
+   correct multi-byte UTF-8 handling."
+  [s]
+  (let [s (str s)]
+    (try
+      (java.net.URLDecoder/decode (str/replace s "+" "%2B") "UTF-8")
+      (catch Exception _ s))))
+
+(defn get-preset-details [uuid]
+  (let [result (auphonic-request :get (str "/preset/" uuid ".json"))]
+    (when (:success result)
+      (get-in result [:data :data]))))
+
+(defn get-services []
+  (let [result (auphonic-request :get "/services.json")]
+    (when (:success result)
+      (let [d (get-in result [:data :data])]
+        (if (map? d) (vals d) d)))))
+
+(defn resolve-service
+  "Resolve a service reference to {:uuid ...}, or {:error ...}, or nil.
+
+   A display name is matched first (case-insensitively) against /services.json;
+   only if nothing matches is the input treated as a UUID. Inferring \"UUID\"
+   from the string's shape alone was wrong: an 18-26 char display name would be
+   passed off as a UUID and 404 with a confusing dead end.
+
+   Ambiguous display names are an error rather than a silent first-match —
+   picking the wrong service would start a production against the wrong files."
+  [service]
+  (let [s (str/trim (str service))]
+    (when-not (str/blank? s)
+      (let [svcs (get-services)
+            named (when svcs
+                    (filterv #(= (str/lower-case (str (:display_name %)))
+                                 (str/lower-case s))
+                             svcs))]
+        (cond
+          (> (count named) 1)
+          {:error (str "Service name '" s "' is ambiguous — " (count named)
+                       " services share it. Pass one of their UUIDs: "
+                       (str/join ", " (map :uuid named)))}
+
+          (= 1 (count named))
+          (let [svc (first named)]
+            (if (false? (:incoming svc))
+              {:error (str "Service '" s "' (" (:type svc) ") is publish-only"
+                           " (incoming=false) and cannot supply input files.")}
+              {:uuid (:uuid svc) :display_name (:display_name svc)}))
+
+          (re-matches #"[A-Za-z0-9]{18,26}" s)
+          {:uuid s}
+
+          ;; Distinguish "the API did not answer" from "no such name". Reporting
+          ;; a rate-limited lookup as "Unknown service" is a confidently wrong
+          ;; diagnosis, and it made dry-run verification untrustworthy.
+          (nil? svcs)
+          {:error (str "Could not list services from the Auphonic API (network"
+                       " error or rate limit), so '" s "' could not be resolved."
+                       " Retry, or pass the service UUID directly.")}
+
+          :else
+          {:error (str "Unknown service '" s "'. Pass a service UUID, or a"
+                       " display name from /services.json (e.g. \"LUP Stems\").")})))))
+
+(defn list-service-files
+  "GET /service/{uuid}/ls.json -> vector of decoded filenames, or nil."
+  [service-uuid]
+  (let [result (auphonic-request :get (str "/service/" service-uuid "/ls.json"))]
+    (when (:success result)
+      (let [d (get-in result [:data :data])]
+        (mapv #(percent-decode (str %))
+              (if (map? d) (vals d) d))))))
+
+(defn flag-true?
+  "Interpret a JSON-ish boolean flag, biased to TRUE when ambiguous.
+
+   Used for dry_run, where TRUE means 'do not perform the side effect'. The
+   previous `(true? dry_run)` treated the string \"true\" and the number 1 as
+   false, so a caller asking for a preview would have started a real, credit-
+   spending production. Anything not clearly false counts as true."
+  [v]
+  (not (or (nil? v)
+           (false? v)
+           (and (number? v) (zero? v))
+           (and (string? v)
+                (contains? #{"false" "0" "no" "off" ""}
+                           (str/lower-case (str/trim v)))))))
+
+(defn parse-episode
+  "Coerce an episode to a whole number.
+
+   The schema says number, but a float (688.0) would build a regex that never
+   matches and an error message that lies. Returns {:episode n} or
+   {:error msg}."
+  [episode]
+  (cond
+    (number? episode) {:episode (long episode)}
+    (and (string? episode) (re-matches #"\s*\d+\s*" episode))
+    {:episode (Long/parseLong (str/trim episode))}
+    :else {:error (str "episode must be a whole number, got " (pr-str episode))}))
+
+(defn track-id-str
+  "Coerce a track-id key from parsed JSON into a plain string.
+
+   JSON objects arrive with keyword keys (:Host), and `str` on a keyword keeps
+   the leading colon — which would be sent to Auphonic as \":Host\"."
+  [k]
+  (cond
+    (keyword? k) (name k)
+    (symbol? k) (name k)
+    :else (str k)))
+
+(defn url-ish?
+  "True when a track value is clearly a URL rather than a service filename."
+  [v]
+  (boolean (re-find #"(?i)^(https?|ftp|sftp)://" (str/trim (str v)))))
+
+(defn encode-path-segment
+  "Percent-encode a value for use as a URL path segment.
+
+   URLEncoder encodes for a form body, where a space becomes '+' — wrong inside
+   a path, so swap it back to %20."
+  [s]
+  (-> (java.net.URLEncoder/encode (str s) "UTF-8")
+      (str/replace "+" "%20")))
+
+(defn attach-track!
+  "Point one track of an existing production at a file on an external service.
+
+   This is the step that actually fills a preset's track. Passing
+   `multi_input_files` at CREATION instead APPENDS to the preset's template,
+   leaving the preset's own tracks empty and duplicating their ids (verified
+   against the live API: 4 sent -> 8 stored, every id duplicated)."
+  [production-uuid track-id service-uuid filename]
+  (auphonic-json-post
+   (str "/production/" production-uuid "/multi_input_files/"
+        (encode-path-segment track-id) ".json")
+   (cond-> {:type "multitrack" :id track-id}
+     service-uuid (assoc :service service-uuid)
+     (not (str/blank? (str filename))) (assoc :input_file filename))))
+
+(defn append-tracks!
+  "Add tracks that the preset does not define (a guest, an edited feed).
+
+   Updates the production with additional multi_input_files — the one place
+   where appending is correct, because these ids genuinely are new."
+  [production-uuid entries service-uuid]
+  (auphonic-json-post
+   (str "/production/" production-uuid ".json")
+   {:multi_input_files
+    (mapv (fn [[tid fname]]
+            (cond-> {:type "multitrack" :id tid}
+              service-uuid (assoc :service service-uuid)
+              (not (str/blank? (str fname))) (assoc :input_file fname)))
+          entries)}))
+
+(defn remove-track!
+  "Delete one track from a production.
+
+   Needed when a preset track is being REPLACED rather than filled — e.g. the
+   preset defines 'Mumble', but the run supplies 'Mumble + Clips' instead.
+   Without this the preset's own track is created and left empty, which pushes
+   the production back over the 8-track limit."
+  [production-uuid track-id]
+  (auphonic-request :delete (str "/production/" production-uuid "/multi_input_files/"
+                                 (encode-path-segment track-id) ".json")))
+
+(defn production-tracks
+  "The production's current track list as Auphonic stored it, or nil."
+  [production-uuid]
+  (let [r (auphonic-request :get (str "/production/" production-uuid ".json"))]
+    (when (:success r)
+      (get-in r [:data :data :multi_input_files]))))
+
+(defn file-track-label
+  "The track portion of a stem filename: text after the last \"- \", minus the
+   extension. \"Show 688 - Chris.flac\" -> \"Chris\".
+
+   Auphonic names stems \"<show> <episode> - <track>.<ext>\", but the live
+   listing also holds unspaced variants (\"Linux Unplugged 635- Brent.flac\"),
+   so the separator is \"- \" rather than \" - \". A name with no separator falls
+   back to the whole stem."
+  [filename]
+  (let [base (str/replace (str filename) #"\.[A-Za-z0-9]{2,5}$" "")]
+    (if-let [i (str/last-index-of base "- ")]
+      (str/trim (subs base (+ i 2)))
+      (str/trim base))))
+
+(defn find-episode-stems
+  "Match service files to track ids for one episode number.
+
+   Filenames must already be percent-decoded — `list-service-files` does that at
+   the API boundary. Expected shape is \"<show> <episode> - <track>.<ext>\".
+
+   The episode must stand as its own whitespace-delimited token, so a recording
+   date embedded in the name (\"LUP 2024-03-11 - Chris.flac\") cannot be mistaken
+   for episode 3 or 11.
+
+   The track must match the filename's tail EXACTLY. There is deliberately no
+   fuzzy substring fallback: \"Wes\" must never match \"Newest.flac\", and
+   \"Chris\" must never match \"Christina.flac\". A reported miss is cheap; a
+   confident wrong file is a broken episode.
+
+   Returns {:matches {track-id filename} :missing [track-id]
+            :episode-candidates [filename] :ambiguous [[track-id [filename...]]]
+            :duplicates [filename]}"
+  [files episode track-ids]
+  (let [ep-re (re-pattern (str "(?:^|\\s)0*"
+                               (java.util.regex.Pattern/quote (str episode))
+                               "(?=\\s|\\(|\\.|-|$)"))
+        ep-files (filterv #(re-find ep-re %) files)
+        candidates-for (fn [track]
+                         (let [tl (str/lower-case (str track))
+                               exact (filterv #(= tl (str/lower-case (file-track-label %)))
+                                              ep-files)
+                               plain (filterv #(not (str/includes? % "(Ads)")) exact)]
+                           (vec (or (seq plain) exact))))
+        matches (into {} (keep (fn [t] (when-let [f (first (candidates-for t))] [t f])))
+                      track-ids)]
+    {:episode-candidates ep-files
+     :matches matches
+     :missing (vec (remove #(contains? matches %) track-ids))
+     ;; More than one equally-exact file for one track is ambiguous, not a
+     ;; first-match-wins: guessing here silently attaches the wrong audio.
+     :ambiguous (vec (keep (fn [t] (let [c (candidates-for t)]
+                                     (when (> (count c) 1) [t c])))
+                           track-ids))
+     :duplicates (vec (keep (fn [[f n]] (when (> n 1) f))
+                            (frequencies (vals matches))))}))
 
 ;; ============================================================================
 ;; MCP Tool Implementations
@@ -328,6 +614,35 @@
                     (:error result)
                     "Failed to delete production")}))))
 
+(defn tool-start-production
+  "Start processing for an existing, saved production.
+
+   Pairs with `action: \"save\"` on start_multitrack_production: create without
+   spending processing time, verify the resolved track list, then start here.
+   POST /production/{uuid}/start.json takes no body."
+  [{:keys [production_uuid]}]
+  (if-let [validation-error (validate-required-fields
+                             {:production_uuid production_uuid}
+                             [:production_uuid])]
+    {:error (:error validation-error)}
+
+    (let [result (auphonic-request :post (str "/production/" production_uuid "/start.json"))]
+      (if (:success result)
+        (let [prod (get-in result [:data :data])
+              uuid (or (:uuid prod) production_uuid)]
+          (track-production! uuid)
+          (println (str "[auphonic-mcp] started production " uuid
+                        " status=" (:status_string prod)))
+          {:content [{:type "text"
+                      :text (str "✓ Production started\n"
+                                 "UUID: " uuid "\n"
+                                 "Status: " (:status_string prod) "\n"
+                                 "View: https://auphonic.com/production/" uuid)}]
+           :production_uuid uuid})
+        {:error (or (get-in result [:data :error_message])
+                    (:error result)
+                    "Failed to start production")}))))
+
 (defn tool-list-presets []
   (let [result (auphonic-request :get "/presets.json")]
     (if (:success result)
@@ -344,6 +659,352 @@
       {:error (or (get-in result [:data :error_message])
                   (:error result)
                   "Failed to list presets")})))
+
+(defn tool-start-multitrack-production
+  "Apply a preset to audio that already lives on an external service, and start it.
+
+   Nothing is uploaded: Auphonic pulls each track from the service itself.
+   Track ids come from the preset; filenames are derived from 'service'+'episode'
+   or supplied explicitly via 'tracks'.
+
+   'action' must be exactly \"start\" (the default) or \"save\". Any other value
+   is rejected rather than guessed — this action spends credits and cannot be
+   undone, so a typo must not silently start a production.
+
+   'dry_run' resolves everything and returns the payload without creating
+   anything. It is read leniently in the SAFE direction: anything not clearly
+   false (true, \"true\", 1) previews instead of posting."
+  [args]
+  (let [{:keys [preset show episode service tracks skip_tracks title basename action dry_run]} args
+        normalized-show (some-> show str/lower-case)
+        preset-uuid (or preset (get (get-available-shows) normalized-show))
+        action (let [a (some-> action str/lower-case str/trim)]
+                 (if (str/blank? (str a)) "start" a))
+        dry? (flag-true? dry_run)
+        skips (cond
+                (nil? skip_tracks) #{}
+                (sequential? skip_tracks)
+                (->> skip_tracks
+                     (map #(str/lower-case (str/trim (str %))))
+                     (remove str/blank?)
+                     set)
+                :else :invalid)
+        parsed-episode (when episode (parse-episode episode))]
+    (cond
+      (nil? preset-uuid)
+      {:error (if show
+                (str "Unknown show '" show "'. Configure AUPHONIC_PRESET_"
+                     (str/upper-case show) "=<PRESET_UUID> or pass 'preset'.")
+                "Missing 'preset' or 'show' argument.")}
+
+      (not (contains? #{"start" "save"} action))
+      {:error (str "Invalid 'action' " (pr-str action)
+                   ". Use \"start\" (default) or \"save\".")}
+
+      (= :invalid skips)
+      {:error (str "'skip_tracks' must be a list of track ids, got "
+                   (pr-str skip_tracks) ".")}
+
+      (and episode (:error parsed-episode))
+      {:error (:error parsed-episode)}
+
+      :else
+      (if-let [preset-data (get-preset-details preset-uuid)]
+        (let [preset-name (:preset_name preset-data)
+              preset-track-ids (->> (:multi_input_files preset-data)
+                                    (filter #(= "multitrack" (:type %)))
+                                    (map :id)
+                                    (remove str/blank?)
+                                    vec)
+              episode-number (:episode parsed-episode)
+              wanted-track-ids (->> preset-track-ids
+                                    (remove #(contains? skips (str/lower-case (str %))))
+                                    vec)
+              explicit-tracks (when (map? tracks)
+                                (into {} (map (fn [[k v]] [(track-id-str k) (str v)]))
+                                      tracks))
+              url-tracks (when explicit-tracks
+                           (->> explicit-tracks
+                                (filter (fn [[_ v]] (url-ish? v)))
+                                (map key)
+                                sort vec))
+              blank-tracks (when explicit-tracks
+                             (->> explicit-tracks
+                                  (filter (fn [[_ v]] (str/blank? (str v))))
+                                  (map key)
+                                  sort vec))
+              unknown-ids (when (and explicit-tracks (seq preset-track-ids))
+                            (let [known (set (map str/lower-case preset-track-ids))]
+                              (->> explicit-tracks
+                                   keys
+                                   (remove #(contains? known (str/lower-case %)))
+                                   sort vec)))
+              svc (when-not (str/blank? (str service)) (resolve-service service))
+              service-uuid (:uuid svc)
+              track-hint (when (seq preset-track-ids)
+                           (str " Preset defines tracks: "
+                                (str/join ", " preset-track-ids) "."))
+              resolution
+              (cond
+                ;; A service that was supplied but could not be resolved is an
+                ;; error even when explicit tracks are given: otherwise the bare
+                ;; filenames get sent as though they were HTTP URLs.
+                (:error svc)
+                {:error (:error svc)}
+
+                (and explicit-tracks (empty? explicit-tracks))
+                {:error "The 'tracks' map is empty."}
+
+                (seq blank-tracks)
+                {:error (str "Track(s) " (str/join ", " blank-tracks)
+                             " have no filename.")}
+
+                ;; Mirror of the above: a service plus URL-ish values would send
+                ;; the URL verbatim as a service filename.
+                (and explicit-tracks service-uuid (seq url-tracks))
+                {:error (str "Track(s) " (str/join ", " url-tracks)
+                             " look like URLs, but 'service' was also given."
+                             " Omit 'service' to pass URLs, or supply service"
+                             " filenames instead.")}
+
+                explicit-tracks
+                {:tracks (->> explicit-tracks
+                              (remove (fn [[k _]] (contains? skips (str/lower-case k))))
+                              (into {}))
+                 :source "explicit 'tracks' argument"
+                 :warn (when (seq unknown-ids)
+                         (str "Track id(s) " (pr-str unknown-ids)
+                              " are not defined by preset " preset-uuid
+                              " — they will have no per-track algorithms."))}
+
+                (and service-uuid episode-number (seq wanted-track-ids))
+                (let [files (list-service-files service-uuid)]
+                  (if (nil? files)
+                    {:error (str "Could not list files on service " service-uuid
+                                 " (network error or rate limit). Retry.")}
+                    (let [{:keys [matches missing episode-candidates
+                                  duplicates ambiguous]}
+                          (find-episode-stems files episode-number wanted-track-ids)]
+                      (cond
+                        (seq ambiguous)
+                        {:error (str "Ambiguous stem for "
+                                     (str/join "; "
+                                               (map (fn [[t c]] (str t " -> " (pr-str c)))
+                                                    ambiguous))
+                                     " — refusing to guess which file to use.")}
+
+                        (seq duplicates)
+                        {:error (str "Tracks resolve to the same file "
+                                     (pr-str duplicates)
+                                     " — refusing to guess which track is which.")}
+
+                        (seq missing)
+                        {:error (str "No stem found for track(s) "
+                                     (str/join ", " missing) " in episode "
+                                     episode-number ". "
+                                     (if (seq episode-candidates)
+                                       (str "Episode " episode-number " has: "
+                                            (str/join ", " episode-candidates))
+                                       (str "Episode " episode-number
+                                            " has no files on that service."))
+                                     (when (seq skips)
+                                       (str " Skipping: " (str/join ", " skips) ".")))}
+
+                        :else
+                        {:tracks matches
+                         :source (str "service " service-uuid ", episode "
+                                      episode-number)}))))
+
+                (str/blank? (str service))
+                {:error (str "Need either 'tracks', or 'service' + 'episode'." track-hint)}
+
+                (and (not (str/blank? (str service))) (nil? episode-number))
+                {:error (str "Pass 'episode' to pick stems from the service, or provide"
+                             " 'tracks' explicitly." track-hint)}
+
+                (empty? preset-track-ids)
+                {:error (str "Preset " preset-uuid " defines no multitrack tracks;"
+                             " pass 'tracks' explicitly.")}
+
+                (empty? wanted-track-ids)
+                {:error (str "No tracks left to run — all of "
+                             (pr-str preset-track-ids) " were skipped.")}
+
+                :else
+                {:error (str "Could not resolve tracks." track-hint)})]
+
+          (if-let [err (:error resolution)]
+            {:error err}
+
+            (let [track-map (:tracks resolution)
+                  pairs (sort-by first track-map)
+                  known-ids (set (map str/lower-case preset-track-ids))
+                  on-preset (filterv (fn [[tid _]]
+                                       (contains? known-ids (str/lower-case (str tid))))
+                                     pairs)
+                  extra (filterv (fn [[tid _]]
+                                   (not (contains? known-ids (str/lower-case (str tid)))))
+                                 pairs)
+                  ;; Preset tracks this run does NOT supply — they are replaced,
+                  ;; so they must be removed or they linger empty.
+                  requested-ids (set (map (fn [[tid _]] (str/lower-case (str tid))) pairs))
+                  dropped (filterv (fn [tid]
+                                     (not (contains? requested-ids
+                                                     (str/lower-case (str tid)))))
+                                   preset-track-ids)
+                  start? (= "start" action)
+                  create-payload (cond-> {:preset preset-uuid}
+                                   (not (str/blank? (str title)))
+                                   (assoc-in [:metadata :title] title)
+                                   (not (str/blank? (str basename)))
+                                   (assoc :output_basename basename))]
+
+              (cond
+                (empty? pairs)
+                {:error "Resolved zero tracks — refusing to create an empty production."}
+
+                dry?
+                (let [mk-entry (fn [[tid fname]] (cond-> {:track_id tid} service-uuid (assoc :service service-uuid) (not (str/blank? (str fname))) (assoc :input_file fname)))]
+                  {:content [{:type "text"
+                              :text (str "DRY RUN — nothing created.\n"
+                                         "Preset: " preset-uuid
+                                         (when preset-name (str " (" preset-name ")")) "\n"
+                                         "Tracks resolved from: " (:source resolution) "\n"
+                                         (when (seq skips)
+                                           (str "Skipping: " (str/join ", " skips) "\n"))
+                                         (when (:warn resolution)
+                                           (str "Warning: " (:warn resolution) "\n"))
+                                         "\nRuns in steps:\n"
+                                         "  1. create production from preset ("
+                                         (count on-preset) " preset track(s))\n"
+                                         "  2. fill each preset track by id\n"
+                                         (when (seq dropped)
+                                           (str "  2b. remove preset track(s) not supplied: "
+                                                (str/join ", " dropped) "\n"))
+                                         (when (seq extra)
+                                           (str "  3. append " (count extra)
+                                                " track(s) the preset does not define: "
+                                                (str/join ", " (map first extra)) "\n"))
+                                         "  4. " (if start? "start processing" "leave saved") "\n"
+                                         "\nTrack list (" (count pairs) "):\n"
+                                         (json/generate-string
+                                          (mapv (fn [[tid fname]]
+                                                  (cond-> {:id tid}
+                                                    service-uuid (assoc :service service-uuid)
+                                                    (not (str/blank? (str fname)))
+                                                    (assoc :input_file fname)))
+                                                pairs)
+                                          {:pretty true}))}]
+                   :dry_run true
+                   :tracks track-map
+                   :plan {:create create-payload
+                          :fill (mapv mk-entry on-preset)
+                          :append (mapv mk-entry extra)
+                          :preset_track_ids (vec preset-track-ids)
+                          :drop (vec dropped)
+                          :start start?}})
+
+                :else
+                (do
+                  (println (str "[auphonic-mcp] multitrack " action
+                                " preset=" preset-uuid
+                                " service=" (or service-uuid "none")
+                                " tracks=" (json/generate-string (into (sorted-map) track-map))))
+                  ;; Phase 1 — create from the preset with NO multi_input_files,
+                  ;; so the preset's own track list is what we start from.
+                  (let [create (auphonic-json-post "/productions.json" create-payload)
+                        uuid (get-in create [:data :data :uuid])]
+                    (if (or (not (:success create)) (str/blank? (str uuid)))
+                      (let [err (or (get-in create [:data :error_message])
+                                    (:error create) "no production UUID returned")]
+                        (println (str "[auphonic-mcp] multitrack create FAILED: " err))
+                        {:error (str "Could not create the production: " err)})
+
+                      (let [;; Phase 2 — fill the preset's own tracks, one call each.
+                            fill (mapv (fn [[tid fname]]
+                                         [tid (attach-track! uuid tid service-uuid fname)])
+                                       on-preset)
+                            ;; Phase 2b — remove preset tracks this run replaces.
+                            ;; Leaving them would make them empty AND push the
+                            ;; production back over the 8-track limit.
+                            drop-results (mapv (fn [tid] [tid (remove-track! uuid tid)])
+                                               dropped)
+                            bad (or (first (filterv (fn [[_ r]] (not (:success r))) fill))
+                                    (first (filterv (fn [[_ r]] (not (:success r)))
+                                                    drop-results)))]
+                        (if bad
+                          (let [[tid r] bad
+                                err (or (get-in r [:data :error_message])
+                                        (:error r) "unknown error")]
+                            (println (str "[auphonic-mcp] multitrack track-update FAILED '"
+                                          tid "': " err))
+                            {:error (str "Updating track '" tid "' failed: " err
+                                         ". A partial production was created ("
+                                         uuid ") — delete it before retrying.")})
+
+                          (let [;; Phase 3 — append the tracks the preset lacks.
+                                app (when (seq extra)
+                                      (append-tracks! uuid extra service-uuid))
+                                app-err (when (and app (not (:success app)))
+                                          (or (get-in app [:data :error_message])
+                                              (:error app) "unknown error"))]
+                            (if app-err
+                              (do
+                                (println (str "[auphonic-mcp] multitrack append FAILED: " app-err))
+                                {:error (str "Adding extra tracks failed: " app-err
+                                             ". A partial production was created ("
+                                             uuid ") — delete it before retrying.")})
+
+                              (let [;; Phase 4 — read back what Auphonic ACTUALLY stored,
+                                    ;; so a mismatch is visible instead of assumed.
+                                    actual (production-tracks uuid)
+                                    actual-ids (mapv :id actual)
+                                    expected-ids (mapv first pairs)
+                                    via-count (when (seq actual)
+                                                (when (not= (count actual) (count pairs))
+                                                  (str "Auphonic stored " (count actual)
+                                                       " tracks but " (count pairs)
+                                                       " were requested.")))
+                                    ;; Phase 5 — start, only when asked.
+                                    started (when start?
+                                              (auphonic-request :post (str "/production/"
+                                                                           uuid "/start.json")))
+                                    start-err (when (and started (not (:success started)))
+                                                (or (get-in started [:data :error_message])
+                                                    (:error started) "unknown error"))]
+                                (track-production! uuid)
+                                (println (str "[auphonic-mcp] multitrack production " uuid
+                                              " stored=" (count actual)
+                                              " ids=" (pr-str actual-ids)
+                                              (when start? (str " started=" (not (boolean start-err))))))
+                                {:content [{:type "text"
+                                            :text (str (if start?
+                                                         (if start-err
+                                                           (str "⚠ Saved, but NOT started: " start-err "\n")
+                                                           "✓ Multitrack production started\n")
+                                                         "✓ Multitrack production saved (not started)\n")
+                                                       "UUID: " uuid "\n"
+                                                       "Tracks stored: " (count actual) "\n"
+                                                       (when via-count (str "⚠ " via-count "\n"))
+                                                       (when (:warn resolution)
+                                                         (str "Warning: " (:warn resolution) "\n"))
+                                                       "\nActual track list:\n"
+                                                       (str/join
+                                                        "\n"
+                                                        (map (fn [t]
+                                                               (str "  " (:id t)
+                                                                    "  <-  " (or (:input_file t) "(no file)")))
+                                                             actual))
+                                                       "\n\nView: https://auphonic.com/production/" uuid)}]
+                                 :production_uuid uuid
+                                 :tracks actual
+                                 :requested_ids expected-ids
+                                 :track_count (count actual)
+                                 :started (and start? (not start-err))}))))))))))))
+
+        {:error (str "Could not load preset: " preset-uuid
+                     " (not found, or the Auphonic API is unreachable or"
+                     " rate-limited).")}))))
 
 ;; ============================================================================
 ;; MCP Resources
@@ -482,9 +1143,52 @@
                                                   :description "Production UUID to delete"}}
                    :required ["production_uuid"]}}
 
+    {:name "start_production"
+     :description (str "Start processing for an existing saved Auphonic production. "
+                       "Pairs with start_multitrack_production's action:\"save\", which creates a "
+                       "production WITHOUT spending processing time: save it, read the track list "
+                       "back via check_status, then start it here.")
+     :inputSchema {:type "object"
+                   :properties {:production_uuid {:type "string"
+                                                  :description "Production UUID to start"}}
+                   :required ["production_uuid"]}}
+
     {:name "list_presets"
      :description "List all available Auphonic presets"
-     :inputSchema {:type "object"}}]})
+     :inputSchema {:type "object"}}
+
+    {:name "start_multitrack_production"
+     :description (str "Start (or save) a multitrack Auphonic production by applying a preset to "
+                       "audio files that ALREADY live on an external service (WebDAV/S3). "
+                       "Nothing is uploaded — Auphonic pulls each track from the service itself. "
+                       "Tracks are taken from the 'tracks' argument, or derived automatically from "
+                       "'service' + 'episode' using the track ids defined in the preset "
+                       "(e.g. episode 688 with tracks Chris/Wes/Brent/Mumble matches "
+                       "'Linux Unplugged 688 - Chris.flac' etc). "
+                       "Set dry_run to resolve the stems and preview the exact request without creating anything.")
+     :inputSchema {:type "object"
+                   :properties {:preset {:type "string"
+                                         :description "Auphonic preset UUID. Overrides 'show'."}
+                                :show {:type "string"
+                                       :description "Show name resolving to AUPHONIC_PRESET_<SHOW> (e.g. 'lup'). Used when 'preset' is absent."}
+                                :service {:type "string"
+                                          :description "External service UUID or display name (e.g. 'LUP Stems') holding the track files."}
+                                :episode {:type "number"
+                                          :description "Episode number used to select stems from 'service' (e.g. 688)."}
+                                :tracks {:type "object"
+                                         :description "Explicit track map {\"Chris\": \"file.flac\", ...}. Overrides service/episode derivation. Ignored if 'service' is given but cannot be resolved."}
+                                :skip_tracks {:type "array"
+                                              :items {:type "string"}
+                                              :description "Track ids to omit (e.g. an episode with no guest track). Optional."}
+                                :title {:type "string"
+                                        :description "Production title metadata (optional)."}
+                                :basename {:type "string"
+                                           :description "output_basename for the production (optional), e.g. 'lup-0689'."}
+                                :action {:type "string"
+                                         :enum ["start" "save"]
+                                         :description "\"start\" (default) to run immediately, or \"save\" to only save the production. Any other value is rejected."}
+                                :dry_run {:type "boolean"
+                                          :description "If true, resolve tracks and show the request that would be sent, without creating anything."}}}}]})
 
 (defn handle-tools-call [{:keys [name arguments]}]
   (let [result (case name
@@ -494,6 +1198,8 @@
                  "download_output" (tool-download-output arguments)
                  "delete_production" (tool-delete-production arguments)
                  "list_presets" (tool-list-presets)
+                 "start_production" (tool-start-production arguments)
+                 "start_multitrack_production" (tool-start-multitrack-production arguments)
                  {:error (str "Unknown tool: " name)})]
     (if (:error result)
       (let [error-msg (str "Error: " (:error result))]
@@ -696,6 +1402,17 @@
           {:status 200
            :headers {"Content-Type" "application/json"}
            :body (json/generate-string {:status "ok"})})
+
+        ;; Streamable HTTP spec 2025-03-26: this server does not offer a
+        ;; server->client SSE stream, so GET on the MCP endpoint must answer
+        ;; 405 Method Not Allowed (not 404) — clients use that to decide
+        ;; whether an event stream is available.
+        [:get "/mcp"]
+        {:status 405
+         :headers {"Content-Type" "application/json"
+                   "Allow" "POST, DELETE"}
+         :body (json/generate-string
+                {:error "Method not allowed. MCP requests use POST; this server does not offer an SSE stream."})}
 
         [:get "/health"]
         {:status 200
