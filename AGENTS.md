@@ -97,9 +97,22 @@ bb auphonic-mcp-server.clj 3007
 Auth via environment variable:
 ```bash
 export AUPHONIC_API_KEY="your-api-token"
-# Show-specific presets
+
+# Show presets, discovered as AUPHONIC_PRESET_<SHOW>, so callers can say
+# show: "lup" instead of pasting a UUID. Live values are in
+# ~/.config/auphonic-mcp/run.sh (the systemd user unit's ExecStart).
 export AUPHONIC_PRESET_LUP="preset-uuid"
 export AUPHONIC_PRESET_LAUNCH="preset-uuid"
+export AUPHONIC_PRESET_TWIB="preset-uuid"
+export AUPHONIC_PRESET_LUP_TRANSCRIBE="preset-uuid"
+export AUPHONIC_PRESET_LAUNCH_TRANSCRIBE="preset-uuid"
+
+# Lineups used when a preset declares no multitrack tracks. The presets in this
+# account define no tracks of their own, so without these
+# start_multitrack_production requires an explicit 'tracks' map and refuses to
+# derive anything from service+episode.
+export AUPHONIC_TRACKS_LUP="Chris,Wes,Brent,Mumble,Clips"
+export AUPHONIC_TRACKS_LAUNCH="Chris,Angela,Caller,Clips"
 ```
 
 ## Tools

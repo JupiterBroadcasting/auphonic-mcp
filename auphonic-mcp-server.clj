@@ -101,6 +101,40 @@
                       (< (count k) 64))))
        (into {})))
 
+(def default-track-sets
+  "Track ids to assume when a show's preset declares no multitrack tracks.
+
+  Presets built for explicit track maps carry no track definitions, which makes
+  service+episode derivation unreachable: the stem matcher refuses to invent a
+  lineup. These are the lineups we actually ship, so derivation works without a
+  hand-written map.
+
+  Filenames are still matched exactly against the service listing, so a lineup
+  change shows up as a reported miss, never as a confidently wrong file."
+  {"lup" ["Chris" "Wes" "Brent" "Mumble" "Clips"]
+   ;; Launch's lineup as it actually appears on the "The Launch STEMS" service
+   ;; ("Launch 73 - Angela.flac", etc). Observed from a single episode, so
+   ;; override with AUPHONIC_TRACKS_LAUNCH when a current run differs rather
+   ;; than trusting it blindly.
+   "launch" ["Chris" "Angela" "Caller" "Clips"]})
+
+(defn get-default-track-set
+  "Track ids for a show, from AUPHONIC_TRACKS_<SHOW> or default-track-sets.
+
+  Returns nil for an unknown show: callers must then demand 'tracks' explicitly
+  rather than invent a lineup."
+  [show]
+  (when-not (str/blank? (str show))
+    (let [s (str/lower-case (str show))
+          env (System/getenv (str "AUPHONIC_TRACKS_" (str/upper-case s)))
+          from-env (when-not (str/blank? (str env))
+                     (->> (str/split env #",")
+                          (map str/trim)
+                          (remove str/blank?)
+                          vec))]
+      (or (not-empty from-env)
+          (get default-track-sets s)))))
+
 (defn validate-file-exists [path]
   (when-not (fs/exists? path)
     {:error (str "File not found: " path)}))
@@ -677,7 +711,12 @@
   [args]
   (let [{:keys [preset show episode service tracks skip_tracks title basename action dry_run]} args
         normalized-show (some-> show str/lower-case)
-        preset-uuid (or preset (get (get-available-shows) normalized-show))
+        shows (get-available-shows)
+        preset-uuid (or preset (get shows normalized-show))
+        ;; A preset UUID given without 'show' still names a show, so recover it
+        ;; from the environment -- the default track set is keyed by show name.
+        preset-show (or normalized-show
+                        (some (fn [[s u]] (when (= u preset-uuid) s)) shows))
         action (let [a (some-> action str/lower-case str/trim)]
                  (if (str/blank? (str a)) "start" a))
         dry? (flag-true? dry_run)
@@ -716,8 +755,11 @@
                                     (map :id)
                                     (remove str/blank?)
                                     vec)
+              fallback-track-ids (when (empty? preset-track-ids)
+                                   (get-default-track-set preset-show))
+              candidate-track-ids (or (seq preset-track-ids) fallback-track-ids)
               episode-number (:episode parsed-episode)
-              wanted-track-ids (->> preset-track-ids
+              wanted-track-ids (->> candidate-track-ids
                                     (remove #(contains? skips (str/lower-case (str %))))
                                     vec)
               explicit-tracks (when (map? tracks)
@@ -741,9 +783,15 @@
                                    sort vec)))
               svc (when-not (str/blank? (str service)) (resolve-service service))
               service-uuid (:uuid svc)
-              track-hint (when (seq preset-track-ids)
+              track-hint (cond
+                           (seq preset-track-ids)
                            (str " Preset defines tracks: "
-                                (str/join ", " preset-track-ids) "."))
+                                (str/join ", " preset-track-ids) ".")
+                           (seq fallback-track-ids)
+                           (str " Show " preset-show " defaults to tracks: "
+                                (str/join ", " fallback-track-ids) ".")
+                           :else
+                           " Pass 'tracks', or set AUPHONIC_TRACKS_<SHOW>=A,B,C.")
               resolution
               (cond
                 ;; A service that was supplied but could not be resolved is an
@@ -812,8 +860,11 @@
 
                         :else
                         {:tracks matches
-                         :source (str "service " service-uuid ", episode "
-                                      episode-number)}))))
+                         :source (str "service " service-uuid ", episode " episode-number
+                                      (when (and (empty? preset-track-ids)
+                                                 (seq fallback-track-ids))
+                                        (str " (default lineup for show "
+                                             preset-show ")")))}))))
 
                 (str/blank? (str service))
                 {:error (str "Need either 'tracks', or 'service' + 'episode'." track-hint)}
@@ -822,13 +873,17 @@
                 {:error (str "Pass 'episode' to pick stems from the service, or provide"
                              " 'tracks' explicitly." track-hint)}
 
-                (empty? preset-track-ids)
-                {:error (str "Preset " preset-uuid " defines no multitrack tracks;"
-                             " pass 'tracks' explicitly.")}
+                (empty? candidate-track-ids)
+                {:error (str "Preset " preset-uuid " defines no multitrack tracks and "
+                             (if preset-show
+                               (str "show " preset-show " has no default track set.")
+                               "no show was given to look one up.")
+                             " Pass 'tracks' explicitly, or set"
+                             " AUPHONIC_TRACKS_<SHOW>=A,B,C.")}
 
                 (empty? wanted-track-ids)
                 {:error (str "No tracks left to run — all of "
-                             (pr-str preset-track-ids) " were skipped.")}
+                             (pr-str candidate-track-ids) " were skipped.")}
 
                 :else
                 {:error (str "Could not resolve tracks." track-hint)})]

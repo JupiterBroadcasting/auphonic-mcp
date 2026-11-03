@@ -1119,6 +1119,72 @@
 
 ;; --- Main Entry ---
 
+;; --- default track lineups -------------------------------------------------
+;; A preset built for explicit track maps declares no multitrack tracks, which
+;; made service+episode derivation unreachable. These cover the fallback that
+;; makes it work, and the loud refusal when no lineup is known.
+
+(t/deftest test-default-track-sets
+  (t/testing "Known shows carry the lineups we actually ship"
+    (t/is (= ["Chris" "Wes" "Brent" "Mumble" "Clips"] (get default-track-sets "lup")))
+    (t/is (some #{"Caller"} (get default-track-sets "launch"))))
+
+  (t/testing "An unknown show yields nil rather than an invented lineup"
+    (t/is (nil? (get-default-track-set "nosuchshow")))
+    (t/is (nil? (get-default-track-set nil)))
+    (t/is (nil? (get-default-track-set "")))))
+
+(defn- no-tracks-preset [_uuid]
+  {:uuid fake-preset-uuid
+   :preset_name "NO-TRACKS"
+   :is_multitrack true
+   :multi_input_files []})
+
+(t/deftest test-multitrack-derives-from-default-lineup
+  (t/testing "A preset with no tracks derives from the show's default lineup"
+    (let [session-id (new-session)
+          resp (with-redefs [get-preset-details no-tracks-preset
+                             get-default-track-set (constantly ["Host" "Guest" "Room"])
+                             get-available-shows (constantly {"fake" fake-preset-uuid})
+                             get-services fake-services
+                             list-service-files fake-service-files]
+                 (rpc-request "tools/call"
+                              {:name "start_multitrack_production"
+                               :arguments {:show "fake"
+                                           :service "Fake Stems"
+                                           :episode 100
+                                           :dry_run true}}
+                              session-id))
+          plan (get-in resp [:body :result :plan])
+          files (into #{} (map :input_file) (:append plan))]
+      (t/is (= 3 (count (:append plan))))
+      (t/is (= #{"Show 100 - Host.flac" "Show 100 - Guest.flac" "Show 100 - Room.flac"}
+               files))
+      (t/is (= [] (:preset_track_ids plan))
+            "the preset declares no tracks, so all three are appended")
+      (t/is (str/includes? (str (get-in resp [:body :result]))
+                           "default lineup for show fake")
+            "a receipt must say where the track list came from")))
+
+  (t/testing "No preset tracks and no default lineup is a loud refusal"
+    (let [session-id (new-session)
+          resp (with-redefs [get-preset-details no-tracks-preset
+                             get-default-track-set (constantly nil)
+                             get-available-shows (constantly {"fake" fake-preset-uuid})
+                             get-services fake-services
+                             list-service-files fake-service-files]
+                 (rpc-request "tools/call"
+                              {:name "start_multitrack_production"
+                               :arguments {:show "fake"
+                                           :service "Fake Stems"
+                                           :episode 100
+                                           :dry_run true}}
+                              session-id))
+          msg (str (get-in resp [:body :result]))]
+      (t/is (str/includes? msg "defines no multitrack tracks"))
+      (t/is (str/includes? msg "AUPHONIC_TRACKS_")
+            "the error must name the fix, not just refuse"))))
+
 (defn -main []
   (println (if live-tests?
              "AUPHONIC_LIVE_TESTS=1 — mutating tests ENABLED."
