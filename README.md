@@ -224,6 +224,37 @@ Tests cover:
 - Resource access
 - Concurrent requests
 
+### Safe Testing Against the Live API
+
+Four things protect a real account from a test run.
+
+**Mutating tests are gated.** Tests that would start a real production only run
+when `AUPHONIC_LIVE_TESTS=1` is set. Without it the suite is structural only:
+
+```bash
+bb test-runner.clj                        # safe: creates no productions
+AUPHONIC_LIVE_TESTS=1 bb test-runner.clj  # creates and deletes real productions
+```
+
+**`start_multitrack_production` accepts `dry_run: true`.** It resolves the preset,
+the service and every track, prints the exact request, and creates nothing. The
+flag is read leniently in the safe direction — anything not clearly false
+previews instead of posting — so a typo cannot start a production. This is how
+track derivation is verified without spending anything:
+
+```json
+{"show": "lup", "service": "LUP Stems", "episode": 691, "dry_run": true}
+```
+
+**`ls.json` rate-limits aggressively.** Listing a service's files more than
+occasionally returns HTTP 429 with "Please do not call ls.json that often!".
+Derivation is not free to spam; back off rather than retrying hard.
+
+**A real run spends credits from the account the key belongs to**, which may not
+be yours. Read `/api/user.json` before starting one. Presets in this account
+declare no multitrack tracks of their own, so derivation needs either an explicit
+`tracks` map or `AUPHONIC_TRACKS_<SHOW>` (see AGENTS.md).
+
 ### Manual Testing
 
 **Health Check:**
