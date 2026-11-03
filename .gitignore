@@ -12,3 +12,7 @@ secrets
 *.secrets
 run.sh
 *.log
+
+# Nix build artifacts (this repo ships a flake, so `nix build` drops these here)
+result
+result-*
