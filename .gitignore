@@ -1,1 +1,14 @@
 .clojure-mcp/
+
+# Credentials must never land in the repo. The server reads the key from an
+# environment variable or an apiKeyFile outside the tree (see README), so a
+# credential file appearing here is always a mistake.
+.env
+*.env
+key
+*.key
+*.pem
+secrets
+*.secrets
+run.sh
+*.log

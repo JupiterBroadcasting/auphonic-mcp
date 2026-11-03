@@ -205,7 +205,7 @@ mcp__auphonic__upload_audio {
 mcp-injector allows up to 50 tool-call iterations per request. A full upload+poll+complete
 workflow uses approximately 3–8 iterations. You have plenty of headroom to poll multiple times.
 
-## Example: user says "process this SCALE recording at /home/wes/recordings/scale.flac for LUP main"
+## Example: user says "process this SCALE recording at /path/to/scale.flac for LUP main"
 
 1. Call `mcp__auphonic__upload_audio` with show=lup, type=main, file_path as given, preset=8ATd9n6gZW9ao8uJKvt8kk
 2. Save the returned production_uuid
